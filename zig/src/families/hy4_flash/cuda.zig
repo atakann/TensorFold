@@ -34,6 +34,7 @@ pub const Kernels = struct {
     add16_fn: Function,
     add32_fn: Function,
     addb_fn: Function,
+    own_fn: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -59,6 +60,7 @@ pub const Kernels = struct {
             .add16_fn = try mod.function("tf_hy4_add16"),
             .add32_fn = try mod.function("tf_hy4_add32"),
             .addb_fn = try mod.function("tf_hy4_addb"),
+            .own_fn = try mod.function("tf_hy4_own"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -142,6 +144,13 @@ pub const Kernels = struct {
         var a: Args = .{};
         inline for (.{ x, f, i64of(n) }) |v| a.add(v);
         try cuda.launch.launch(k.add32_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// Expert parallel picks: this rank's experts lo..lo+count renumbered from 0, the others to `count` at weight 0.
+    pub fn own(k: *const Kernels, s: Stream, picks: u64, wts: u64, n: usize, lo: usize, count: usize) !void {
+        var a: Args = .{};
+        inline for (.{ picks, wts, i64of(n), @as(c_int, @intCast(lo)), @as(c_int, @intCast(count)) }) |v| a.add(v);
+        try cuda.launch.launch(k.own_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// a fp32 += b bf16 over n values.

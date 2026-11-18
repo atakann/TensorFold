@@ -308,3 +308,16 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_addb(float* a, const __
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) a[i] += __bfloat162float(b[i]);
 }
+
+// Expert parallel picks: ids lo..lo+count-1 to this rank's 0..count-1, the others to `count` (skipped) at weight 0.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_own(int* picks, float* wts, int64_t n, int lo, int count) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int e = picks[i] - lo;
+  if (e < 0 || e >= count) {
+    picks[i] = count;
+    wts[i] = 0.0f;
+  } else {
+    picks[i] = e;
+  }
+}

@@ -94,6 +94,11 @@ pub const Group = struct {
         try g.call(g.lib.api.ncclAllGather(mine, all, bytes, .u8, g.comm, s.handle), "ncclAllGather");
     }
 
+    /// `count` fp32 values at `ptr` summed over the ranks in place, on `s`.
+    pub fn allReduceSum(g: *const Group, s: Stream, ptr: u64, count: usize) !void {
+        try g.call(g.lib.api.ncclAllReduce(ptr, ptr, count, .f32, .sum, g.comm, s.handle), "ncclAllReduce");
+    }
+
     /// A call's result: once the group is aborted, a failure ends as Aborted, not at lib.check's fatal stop.
     fn call(g: *const Group, res: nccl.Result, what: []const u8) !void {
         if (res != 0 and g.aborted.load(.acquire)) return error.Aborted;

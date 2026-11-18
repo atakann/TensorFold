@@ -57,6 +57,8 @@ const Loader = struct {
     d: *const cuda.Driver,
     ck: *core.checkpoint.Checkpoint,
     bufs: *Bufs,
+    rank: usize = 0,
+    world: usize = 1,
 
     fn tensor(l: Loader, comptime fmt: []const u8, args: anytype) !Tensor {
         var buf: [200]u8 = undefined;
@@ -88,8 +90,12 @@ const Loader = struct {
         return .{ .fn_ = try l.w(prefix ++ "_fn", args), .base = try l.w(prefix ++ "_base", args), .scale = try l.w(prefix ++ "_scale", args) };
     }
 
-    /// NVFP4 SwiGLU experts packed as X lays them out: `count` under "{pre}{e}." or one under "{pre}".
-    fn experts(l: Loader, comptime pre: []const u8, args: anytype, comptime single: bool, count: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
+    /// NVFP4 SwiGLU experts e0..e0+count (or one) packed as X lays them out, cut to intermediate rows lo..lo+ni.
+    fn experts(l: Loader, comptime pre: []const u8, args: anytype, comptime single: bool, e0: usize, count: usize, total: usize, lo: usize, ni: usize, d: usize, limit: f32) !cuda.experts.Layer {
+        const dc = try l.gpa.alloc(u8, d * ni / 2);
+        defer l.gpa.free(dc);
+        const dsc = try l.gpa.alloc(u8, d * ni / 16);
+        defer l.gpa.free(dsc);
         const up_len = X.bytes(1, ni, d, 2) / 4;
         const down_len = X.bytes(1, d, ni, 1) / 4;
         const ups = try l.gpa.alloc(u32, count * up_len);
@@ -105,10 +111,21 @@ const Loader = struct {
             var g: [3]f32 = undefined;
             inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
                 const name = if (single) pre ++ proj ++ "." else pre ++ "{d}." ++ proj ++ ".";
-                const xa = if (single) args else args ++ .{e};
+                const xa = if (single) args else args ++ .{e0 + e};
                 q[m][0] = (try l.tensor(name ++ "weight", xa)).bytes;
                 q[m][1] = (try l.tensor(name ++ "weight_scale", xa)).bytes;
                 g[m] = std.mem.bytesAsValue(f32, (try l.tensor(name ++ "weight_scale_2", xa)).bytes[0..4]).*;
+            }
+            if (ni != total) { // gate and up: whole rows; down: each row's columns lo..lo+ni
+                for (0..2) |m| {
+                    q[m][0] = q[m][0][lo * d / 2 ..][0 .. ni * d / 2];
+                    q[m][1] = q[m][1][lo * d / 16 ..][0 .. ni * d / 16];
+                }
+                for (0..d) |r| {
+                    @memcpy(dc[r * ni / 2 ..][0 .. ni / 2], q[2][0][r * total / 2 + lo / 2 ..][0 .. ni / 2]);
+                    @memcpy(dsc[r * ni / 16 ..][0 .. ni / 16], q[2][1][r * total / 16 + lo / 16 ..][0 .. ni / 16]);
+                }
+                q[2] = .{ dc, dsc };
             }
             X.packGateUp(ups[e * up_len ..][0..up_len], q[0], q[1], ni, d);
             X.packOne(downs[e * down_len ..][0..down_len], q[2][0], q[2][1], d, ni);
@@ -140,13 +157,24 @@ pub const Model = struct {
     /// The streams [4][hidden] bf16 of the rows at hand, and every token so far (Engram reads the two before).
     x: u64 = 0,
     tokens: std.ArrayList(i32) = .empty,
+    /// Tensor parallel: this rank's heads, experts and Engram tables; partial sums meet in `group`.
+    group: ?*const cuda.tp_group.Group = null,
+    rank: usize = 0,
+    world: usize = 1,
+
+    fn sum(m: *Model, p: u64, count: usize) !void {
+        if (m.group) |g| try g.allReduceSum(m.s, p, count);
+    }
 
     /// Every layer of `c` from `ck` onto the device; `heads` the Engram head sizes by layer id (config.json).
-    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k: *const Kernels, ck: *core.checkpoint.Checkpoint, cfg: config.Config, heads: []const [engram.heads]u32, context: usize) !Model {
+    pub fn open(gpa: std.mem.Allocator, d: *const cuda.Driver, s: cuda.Stream, k: *const Kernels, ck: *core.checkpoint.Checkpoint, cfg: config.Config, heads: []const [engram.heads]u32, context: usize, group: ?*const cuda.tp_group.Group) !Model {
         const c = cfg.text;
-        var m: Model = .{ .gpa = gpa, .d = d, .s = s, .k = k, .c = c, .eg = cfg.engram, .layers = try gpa.alloc(Layer, c.layers), .embed = undefined, .norm = 0, .head = undefined, .lm = 0, .cache = try gpa.alloc(u64, c.layers), .context = context };
+        const rank = if (group) |g| g.rank else 0;
+        const world = if (group) |g| g.world else 1;
+        if (c.sparse.q % world != 0 or c.sliding.q % world != 0 or c.experts % world != 0) return error.TensorParallelSplit;
+        var m: Model = .{ .gpa = gpa, .d = d, .s = s, .k = k, .c = c, .eg = cfg.engram, .layers = try gpa.alloc(Layer, c.layers), .embed = undefined, .norm = 0, .head = undefined, .lm = 0, .cache = try gpa.alloc(u64, c.layers), .context = context, .group = group, .rank = rank, .world = world };
         errdefer m.close();
-        const l: Loader = .{ .gpa = gpa, .d = d, .ck = ck, .bufs = &m.weights };
+        const l: Loader = .{ .gpa = gpa, .d = d, .ck = ck, .bufs = &m.weights, .rank = rank, .world = world };
         m.embed = (try l.tensor("model.embed_tokens.weight", .{})).bytes;
         m.norm = try l.w("model.norm.weight", .{});
         m.head = try l.hc("model.hc_head.hc_head", .{});
@@ -159,7 +187,8 @@ pub const Model = struct {
         };
         var engram_n: usize = 0;
         for (0..c.layers) |i| {
-            m.layers[i] = try loadLayer(l, c, i, if (c.engram[i]) heads[engram_n] else undefined);
+            const owner = c.engram[i] and engram_n % world == rank; // Engram tables a rank by turns
+            m.layers[i] = try loadLayer(l, c, i, if (owner) heads[engram_n] else undefined, owner);
             engram_n += @intFromBool(c.engram[i]);
             var b = try cuda.DeviceBuffer.alloc(d, context * row_width * 2);
             try m.weights.append(gpa, b);
@@ -222,7 +251,7 @@ pub const Model = struct {
         for (m.layers, 0..) |*L, i| {
             at = i;
             stage = "engram";
-            if (L.engram) |*e| try m.engramAdd(e, p0, n);
+            if (c.engram[i]) try m.engramAdd(if (L.engram) |*e| e else null, p0, n);
             stage = "attention";
             const h = try m.zeros(n * hd * 2);
             const post = try m.zeros(n * c.hc * 4);
@@ -303,13 +332,16 @@ pub const Model = struct {
         try k.gateRows(m.s, o, g, n * H * 256);
         const proj = try m.zeros(n * hd * 4);
         try m.k.dense.rows(m.s, o, H * 256, a.o, proj, hd, n, hd, H * 256);
+        try m.sum(proj, n * hd);
         const out = try m.zeros(n * hd * 2);
         try k.rmsNorm(m.s, proj, hd, a.post_norm, out, hd, n, hd, c.eps);
         return out;
     }
 
     /// x [n][d] bf16 through `t` on the picks (`per` a row) into bf16 [n][d] weighted by `wts`.
-    fn grouped(m: *Model, t: cuda.experts.Layer, x: u64, picks: u64, wts: u64, n: usize, per: usize) !u64 {
+    fn grouped(m: *Model, t_: cuda.experts.Layer, x: u64, picks: u64, wts: u64, n: usize, per: usize, skip: i32) !u64 {
+        var t = t_;
+        if (skip >= 0) t.experts += 1; // the other ranks' picks, planned as one more expert and skipped
         const pairs = n * per;
         const tile = cuda.experts.promptTile(.nvfp4);
         const items = cuda.grouped.maxItems(pairs, t.experts, tile);
@@ -319,8 +351,8 @@ pub const Model = struct {
         const act = try m.zeros(pairs * t.width * 2);
         const y = try m.zeros(pairs * t.dims * 2);
         const g: cuda.experts.Grouped = .{ .nvfp4 = &m.k.x };
-        try g.prompt(m.s, .up, .{ .x = x, .stride = t.dims, .slots = per }, t, plan, act, items, pairs, tile, -1);
-        try g.prompt(m.s, .down_bf16, .{ .x = act, .stride = t.width }, t, plan, y, items, pairs, tile, -1);
+        try g.prompt(m.s, .up, .{ .x = x, .stride = t.dims, .slots = per }, t, plan, act, items, pairs, tile, skip);
+        try g.prompt(m.s, .down_bf16, .{ .x = act, .stride = t.width }, t, plan, y, items, pairs, tile, skip);
         const out = try m.zeros(n * t.dims * 2);
         try m.k.glue.combine(m.s, y, .bf16, wts, out, .bf16, n, per, t.dims);
         return out;
@@ -331,7 +363,7 @@ pub const Model = struct {
         const ones = try m.gpa.alloc(f32, n);
         defer m.gpa.free(ones);
         @memset(ones, 1);
-        return m.grouped(t, x, try m.zeros(n * 4), try m.up(std.mem.sliceAsBytes(ones)), n, 1);
+        return m.grouped(t, x, try m.zeros(n * 4), try m.up(std.mem.sliceAsBytes(ones)), n, 1, -1);
     }
 
     fn mlp(m: *Model, p: *const Mlp, x: u64, n: usize) !u64 {
@@ -339,7 +371,12 @@ pub const Model = struct {
         const hd: usize = c.hidden;
         const out = try m.zeros(n * hd * 2);
         switch (p.*) {
-            .dense => |dm| try m.k.k.rmsNorm16(m.s, try m.one(dm.t, x, n), hd, dm.norm, out, hd, n, hd, c.eps),
+            .dense => |dm| {
+                const y = try m.zeros(n * hd * 4);
+                try m.k.k.addb(m.s, y, try m.one(dm.t, x, n), n * hd);
+                try m.sum(y, n * hd);
+                try m.k.k.rmsNorm(m.s, y, hd, dm.norm, out, hd, n, hd, c.eps);
+            },
             .moe => |e| {
                 const E: usize = c.experts;
                 const K: usize = c.topk;
@@ -353,10 +390,13 @@ pub const Model = struct {
                 try m.k.dense.rows(m.s, x, hd, e.down, xl_f, lat, n, lat, hd);
                 const xl = try m.zeros(n * lat * 2);
                 try m.k.k.castRows(m.s, xl_f, lat, xl, lat, n, lat);
-                const combined = try m.grouped(e.routed, xl, picks, wts, n, K);
+                const own = e.routed.experts;
+                if (m.world > 1) try m.k.k.own(m.s, picks, wts, n * K, m.rank * own, own);
+                const combined = try m.grouped(e.routed, xl, picks, wts, n, K, if (m.world > 1) @intCast(own) else -1);
                 const routed = try m.zeros(n * hd * 4);
                 try m.k.dense.rows(m.s, combined, lat, e.up, routed, hd, n, hd, lat);
                 try m.k.k.addb(m.s, routed, try m.one(e.shared, x, n), n * hd);
+                try m.sum(routed, n * hd);
                 try m.k.k.rmsNorm(m.s, routed, hd, e.norm, out, hd, n, hd, c.eps);
             },
         }
@@ -364,7 +404,17 @@ pub const Model = struct {
     }
 
     /// Engram's residual into the streams of rows p0..: each row's n-grams from the tokens before it.
-    fn engramAdd(m: *Model, e: *const Engram, p0: usize, n: usize) !void {
+    fn engramAdd(m: *Model, e_: ?*const Engram, p0: usize, n: usize) !void {
+        const hd: usize = m.c.hidden;
+        const S: usize = m.c.hc;
+        const res = try m.zeros(n * S * hd * 4);
+        if (e_) |e| try m.engramResidual(e, p0, n, res);
+        try m.sum(res, n * S * hd);
+        try m.k.k.add16(m.s, m.x, res, n * S * hd);
+    }
+
+    /// Engram's residual [n][S][hidden] fp32 of rows p0.. on the rank that holds the layer's table.
+    fn engramResidual(m: *Model, e: *const Engram, p0: usize, n: usize, res: u64) !void {
         const hd: usize = m.c.hidden;
         const S: usize = m.c.hc;
         const hash = try m.gpa.alloc(i32, n * engram.heads);
@@ -393,9 +443,7 @@ pub const Model = struct {
             try m.k.dense.rows(m.s, rows, ew, e.key[s], key + s * hd * 4, S * hd, n, hd, ew);
             try m.k.k.bias(m.s, key + s * hd * 4, S * hd, e.key_bias[s], n, hd);
         }
-        const res = try m.zeros(n * S * hd * 4);
         try m.k.k.engramMix(m.s, key, value, m.x, e.mix, eps_engram, res, n, hd);
-        try m.k.k.add16(m.s, m.x, res, n * S * hd);
     }
 };
 
@@ -404,10 +452,12 @@ fn bf16of(v: f32) u16 {
     return @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
 }
 
-fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32) !Layer {
+fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, engram_here: bool) !Layer {
     const p = "model.layers.{d}.";
     const sliding = c.kinds[i] == .sliding;
-    const H: usize = c.heads(@intCast(i)).q;
+    const H_all: usize = c.heads(@intCast(i)).q;
+    const H = H_all / l.world;
+    const h0 = l.rank * H; // this rank's heads h0..h0+H
     const freqs = cuda.mla.ropeFreqs(if (sliding) sliding_theta else sparse_theta);
     // kv_b [H][192 + 256][512] split into wk [H][192][512] and wv [H][256][512]
     const kvb = (try l.tensor(p ++ "self_attn.kv_b_proj.weight", .{i})).bytes;
@@ -416,22 +466,32 @@ fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32) !Lay
     const wv = try l.gpa.alloc(u8, H * 256 * 1024);
     defer l.gpa.free(wv);
     for (0..H) |h| {
-        @memcpy(wk[h * 192 * 1024 ..][0 .. 192 * 1024], kvb[h * 448 * 1024 ..][0 .. 192 * 1024]);
-        @memcpy(wv[h * 256 * 1024 ..][0 .. 256 * 1024], kvb[(h * 448 + 192) * 1024 ..][0 .. 256 * 1024]);
+        @memcpy(wk[h * 192 * 1024 ..][0 .. 192 * 1024], kvb[(h0 + h) * 448 * 1024 ..][0 .. 192 * 1024]);
+        @memcpy(wv[h * 256 * 1024 ..][0 .. 256 * 1024], kvb[((h0 + h) * 448 + 192) * 1024 ..][0 .. 256 * 1024]);
     }
     const a = p ++ "self_attn.";
-    const attn: Attn = .{ .q_a = try l.w(a ++ "q_a_proj.weight", .{i}), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", .{i}), .q_b = try l.w(a ++ "q_b_proj.weight", .{i}), .kv_a = try l.w(a ++ "kv_a_proj_with_mqa.weight", .{i}), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", .{i}), .wk = try l.up(wk), .wv = try l.up(wv), .sink = try l.w(a ++ "learnable_sink_param", .{i}), .gate = try l.w(a ++ "linear_gate.weight", .{i}), .o = try l.w(a ++ "o_proj.weight", .{i}), .post_norm = try l.w(a ++ "post_proj_norm.weight", .{i}), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
+    const hd: usize = c.hidden;
+    const rows = H * 256 * 2; // a head slice's bytes a hidden column of q_b's and the gate's outputs
+    const o_all = (try l.tensor(a ++ "o_proj.weight", .{i})).bytes;
+    const o = try l.gpa.alloc(u8, hd * rows);
+    defer l.gpa.free(o);
+    for (0..hd) |r| @memcpy(o[r * rows ..][0..rows], o_all[r * H_all * 512 + h0 * 512 ..][0..rows]);
+    const sink = (try l.tensor(a ++ "learnable_sink_param", .{i})).bytes[h0 * 4 ..][0 .. H * 4];
+    const attn: Attn = .{ .q_a = try l.w(a ++ "q_a_proj.weight", .{i}), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", .{i}), .q_b = try l.up((try l.tensor(a ++ "q_b_proj.weight", .{i})).bytes[h0 * 256 * c.q_rank * 2 ..][0 .. H * 256 * c.q_rank * 2]), .kv_a = try l.w(a ++ "kv_a_proj_with_mqa.weight", .{i}), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", .{i}), .wk = try l.up(wk), .wv = try l.up(wv), .sink = try l.up(sink), .gate = try l.up((try l.tensor(a ++ "linear_gate.weight", .{i})).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2]), .o = try l.up(o), .post_norm = try l.w(a ++ "post_proj_norm.weight", .{i}), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
     const mp = p ++ "mlp.";
-    const mlp_: Mlp = if (!c.moe[i]) .{ .dense = .{ .t = try l.experts(mp, .{i}, true, 1, c.dense_inter, c.hidden, 0), .norm = try l.w(mp ++ "post_fc2_norm.weight", .{i}) } } else .{ .moe = .{
+    const di = c.dense_inter / l.world;
+    const si = c.expert_inter * c.shared / l.world;
+    const eo = c.experts / l.world;
+    const mlp_: Mlp = if (!c.moe[i]) .{ .dense = .{ .t = try l.experts(mp, .{i}, true, 0, 1, c.dense_inter, l.rank * di, di, hd, 0), .norm = try l.w(mp ++ "post_fc2_norm.weight", .{i}) } } else .{ .moe = .{
         .router = try l.w(mp ++ "gate.weight", .{i}),
         .bias = try l.w(mp ++ "gate.e_score_correction_bias", .{i}),
         .down = try l.w(mp ++ "routed_expert_down_proj.weight", .{i}),
         .up = try l.w(mp ++ "routed_expert_up_proj.weight", .{i}),
-        .routed = try l.experts(mp ++ "experts.", .{i}, false, c.experts, c.expert_inter, c.latent, c.swiglu_limit),
-        .shared = try l.experts(mp ++ "shared_experts.", .{i}, true, 1, c.expert_inter * c.shared, c.hidden, 0),
+        .routed = try l.experts(mp ++ "experts.", .{i}, false, l.rank * eo, eo, c.expert_inter, 0, c.expert_inter, c.latent, c.swiglu_limit),
+        .shared = try l.experts(mp ++ "shared_experts.", .{i}, true, 0, 1, c.expert_inter * c.shared, l.rank * si, si, hd, 0),
         .norm = try l.w(mp ++ "combine_output_norm.weight", .{i}),
     } };
-    return .{ .attn = attn, .hc_attn = try l.hc(p ++ "hc_attn_layer.hc_pre.hc", .{i}), .hc_ffn = try l.hc(p ++ "hc_mlp_layer.hc_pre.hc", .{i}), .in_norm = try l.w(p ++ "input_layernorm.weight", .{i}), .post_norm = try l.w(p ++ "post_attention_layernorm.weight", .{i}), .mlp = mlp_, .engram = if (c.engram[i]) try loadEngram(l, i, heads) else null };
+    return .{ .attn = attn, .hc_attn = try l.hc(p ++ "hc_attn_layer.hc_pre.hc", .{i}), .hc_ffn = try l.hc(p ++ "hc_mlp_layer.hc_pre.hc", .{i}), .in_norm = try l.w(p ++ "input_layernorm.weight", .{i}), .post_norm = try l.w(p ++ "post_attention_layernorm.weight", .{i}), .mlp = mlp_, .engram = if (engram_here) try loadEngram(l, i, heads) else null };
 }
 
 fn loadEngram(l: Loader, i: usize, moduli: [engram.heads]u32) !Engram {

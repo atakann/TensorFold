@@ -39,6 +39,11 @@ fn readConfig(gpu: check.Gpu, dir: []const u8, heads: *std.ArrayList([hy4.engram
     return cfg;
 }
 
+fn envInt(name: [:0]const u8, default: usize) usize {
+    const v = std.c.getenv(name) orelse return default;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+}
+
 fn relRows(got: []const f32, want: []align(1) const f32) f64 {
     var dd: f64 = 0;
     var ww: f64 = 0;
@@ -65,10 +70,14 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     defer ck.close();
     var ref = try core.checkpoint.Checkpoint.openModel(gpa, gpu.io, rest[1]);
     defer ref.close();
+    // TF_TP_RANK of TF_TP_WORLD (NCCL_COMM_ID: rank 0's address): this rank's share, partial sums over NCCL
+    const world = envInt("TF_TP_WORLD", 1);
+    var group: ?cuda.tp_group.Group = if (world > 1) try cuda.tp_group.Group.open(gpu.d, envInt("TF_TP_RANK", 0), world) else null;
+    defer if (group) |*g| g.close();
     const t0 = check.now(gpu.io);
-    var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 1024);
+    var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 1024, if (group) |*g| g else null);
     defer m.close();
-    std.debug.print("  opened {d} layers in {d:.1} s\n", .{ cfg.text.layers, @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9 });
+    std.debug.print("  rank {d} of {d}: opened {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9 });
     const ids: []align(1) const i32 = std.mem.bytesAsSlice(i32, (try ref.get("input_ids")).bytes);
     const n = ids.len;
     const V: usize = cfg.text.vocab;
