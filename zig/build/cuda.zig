@@ -99,6 +99,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("nemotron", mods.nemotron);
     const hy4 = b.createModule(.{ .root_source_file = b.path("zig/src/families/hy4_flash/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     hy4.addImport("cuda", cuda);
+    hy4.addImport("core", mods.core);
     runner.addImport("hy4_flash", hy4);
     runner.addImport("qwen35", mods.qwen35);
     runner.addImport("flashnext", flashnextModule(b, target, optimize, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api));

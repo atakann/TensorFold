@@ -4,6 +4,9 @@ const cuda = @import("cuda");
 
 /// The host side of Engram's hashes.
 pub const engram = @import("engram.zig");
+/// The model on one GPU: weights, latent caches, a chunk of rows a step.
+pub const engine = @import("engine.zig");
+pub const config = @import("config.zig");
 
 const Stream = cuda.Stream;
 const Args = cuda.launch.Args;
