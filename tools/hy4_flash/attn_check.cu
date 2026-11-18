@@ -37,6 +37,32 @@ __global__ void __launch_bounds__(128) hy4_merge_sink(const float* po, const flo
   for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
 }
 
+__global__ void __launch_bounds__(128) hy4_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa,
+                                                    int64_t rows, int64_t heads, int64_t rb, int64_t qs, int64_t qaw) {
+  tf_mla::absorb_q<192>(q, wk, qa, rows, heads, rb, qs, qaw);
+}
+
+__global__ void __launch_bounds__(128) hy4_expand_v(const __nv_bfloat16* ol, const __nv_bfloat16* wv,
+                                                    __nv_bfloat16* out, int64_t rows, int64_t heads, int64_t rb) {
+  tf_mla::expand_v<256>(ol, wv, out, rows, heads, rb);
+}
+
+static __nv_bfloat16* bfp(torch::Tensor t) { return reinterpret_cast<__nv_bfloat16*>(t.data_ptr()); }
+
+// q [rows][heads][256] (nope 192, then rope 64) and wk [heads][192][512] into qa [rows][heads][576]'s latent part
+void absorb(torch::Tensor q, torch::Tensor wk, torch::Tensor qa) {
+  const int64_t rows = q.size(0), heads = q.size(1), rb = rows >= 64 ? 64 : rows;
+  hy4_absorb_q<<<dim3(heads, 512 / 32, (rows + rb - 1) / rb), 128>>>(bfp(q), bfp(wk), bfp(qa), rows, heads, rb, 256, 576);
+}
+
+// ol [rows][heads][512] and wv [heads][256][512] into out [rows][heads][256]
+torch::Tensor expand(torch::Tensor ol, torch::Tensor wv) {
+  const int64_t rows = ol.size(0), heads = ol.size(1), rb = rows >= 64 ? 64 : rows;
+  auto out = torch::empty({rows, heads, 256}, ol.options());
+  hy4_expand_v<<<dim3(heads, 256 / 16, (rows + rb - 1) / rb), 128>>>(bfp(ol), bfp(wv), bfp(out), rows, heads, rb);
+  return out;
+}
+
 torch::Tensor attend(torch::Tensor qa, torch::Tensor lc, torch::Tensor pos, torch::Tensor tok, torch::Tensor cnt,
                      torch::Tensor sink, double scale, int64_t nch, bool sparse, bool use_sink) {
   const int64_t rows = qa.size(0), heads = qa.size(1), w = sparse ? tok.size(1) : 0;
@@ -55,4 +81,8 @@ torch::Tensor attend(torch::Tensor qa, torch::Tensor lc, torch::Tensor pos, torc
   return out;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("attend", &attend); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("attend", &attend);
+  m.def("absorb", &absorb);
+  m.def("expand", &expand);
+}
