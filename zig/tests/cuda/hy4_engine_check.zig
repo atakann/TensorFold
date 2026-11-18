@@ -113,8 +113,7 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     try check.expect(worst < 1e-2 and flips == 0, "hy4 engine: chunked and decode rows differ: rel err {e}, {d} flips", .{ worst, flips });
 }
 
-/// hy4-generate CKPT IDS N: the prompt's token ids (IDS: a file of comma-separated ids) through the whole model,
-/// then N greedy tokens; rank 0 prints the ids and the decode speed (every rank decodes the same tokens).
+/// hy4-generate CKPT IDS N: a prompt (comma-separated ids in a file), then N greedy tokens; rank 0 prints them.
 pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
     if (rest.len != 3) return error.UnknownCommand;
     const gpa = gpu.gpa;
