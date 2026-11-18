@@ -44,6 +44,26 @@ fn envInt(name: [:0]const u8, default: usize) usize {
     return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
 }
 
+/// config.json's DFly keys: the target layers whose caches the draft layers read, and the mask token.
+fn dflyConfig(gpu: check.Gpu, dir: []const u8, kv: *[8]u32, mask: *u32) !usize {
+    const gpa = gpu.gpa;
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+    defer gpa.free(path);
+    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    mask.* = @intCast(o.get("dfly_mask_token_id").?.integer);
+    const items = o.get("dfly_target_kv_layers").?.array.items;
+    for (items, 0..) |v, i| kv[i] = @intCast(v.integer);
+    return items.len;
+}
+
+fn ms(ns: i96) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1e6;
+}
+
 fn relRows(got: []const f32, want: []align(1) const f32) f64 {
     var dd: f64 = 0;
     var ww: f64 = 0;
@@ -140,23 +160,61 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
     const t0 = check.now(gpu.io);
     var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 8192, if (group) |*g| g else null);
     defer m.close();
+    if (std.c.getenv("TF_HY4_PROF") != null) m.prof = gpu.io;
     const t1 = check.now(gpu.io);
     std.debug.print("  rank {d} of {d}: {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
     const V: usize = cfg.text.vocab;
-    const row = try gpa.alloc(f32, V);
-    defer gpa.free(row);
-    try m.step(ids.items, true, row);
+    const D = hy4.dfly.drafts;
+    const rows = try gpa.alloc(f32, (D + 1) * V);
+    defer gpa.free(rows);
+    // TF_HY4_DFLY=1: the checkpoint's DFly drafter proposes, one target step verifies the block
+    var draft: ?hy4.dfly.Draft = null;
+    if (std.c.getenv("TF_HY4_DFLY") != null) {
+        var kv: [8]u32 = undefined;
+        var mask: u32 = 0;
+        const n_kv = try dflyConfig(gpu, rest[0], &kv, &mask);
+        const l: engine.Loader = .{ .gpa = gpa, .d = gpu.d, .ck = &ck, .bufs = &m.weights, .rank = m.rank, .world = m.world, .s = s, .packer = &k.packer, .context = m.context };
+        draft = try hy4.dfly.Draft.load(l, gpa, kv[0..n_kv], mask, cfg.text.q_rank, cfg.text.hidden);
+    }
+    try m.step(ids.items, true, rows);
+    try m.keepRow(0);
     const t2 = check.now(gpu.io);
     var out: std.ArrayList(i32) = .empty;
     defer out.deinit(gpa);
-    for (0..steps) |_| {
-        const next: i32 = @intCast(std.mem.indexOfMax(f32, row));
+    var next: i32 = @intCast(std.mem.indexOfMax(f32, rows[0..V]));
+    var rounds: usize = 0;
+    const eos: i32 = @intCast(cfg.eos);
+    gen: while (out.items.len < steps) {
         try out.append(gpa, next);
-        if (next == @as(i32, @intCast(cfg.eos))) break;
-        try m.step(&.{next}, true, row);
+        if (next == eos) break;
+        if (draft) |*dr| {
+            var d: [D]i32 = undefined;
+            try dr.propose(&m, next, &d);
+            const p0 = m.tokens.items.len;
+            var block: [D + 1]i32 = undefined;
+            block[0] = next;
+            @memcpy(block[1..], &d);
+            try m.step(&block, false, rows);
+            var a: usize = 0;
+            while (a < D and std.mem.indexOfMax(f32, rows[a * V ..][0..V]) == @as(usize, @intCast(d[a]))) a += 1;
+            m.tokens.shrinkRetainingCapacity(p0 + 1 + a);
+            try m.keepRow(a);
+            rounds += 1;
+            for (d[0..a]) |v| {
+                try out.append(gpa, v);
+                if (v == eos) break :gen;
+            }
+            next = @intCast(std.mem.indexOfMax(f32, rows[a * V ..][0..V]));
+        } else {
+            try m.step(&.{next}, true, rows);
+            next = @intCast(std.mem.indexOfMax(f32, rows[0..V]));
+        }
     }
     const t3 = check.now(gpu.io);
     if (m.rank != 0) return;
+    if (m.prof != null) std.debug.print("  time (prompt and decode, ms): engram {d:.0}, attention {d:.0}, mlp {d:.0}, head and the rest {d:.0}\n", .{ ms(m.times[0]), ms(m.times[1]), ms(m.times[2]), ms(m.times[3]) });
+    if (m.prof != null) std.debug.print("  inside attention (ms): rope, kv rows and absorb {d:.0}, chunks {d:.0}, merge and expand {d:.0}, gate {d:.0}\n", .{ ms(m.times[4]), ms(m.times[5]), ms(m.times[7]), ms(m.times[6]) });
+    if (rounds > 0) std.debug.print("  DFly: {d} rounds, {d:.2} tokens a round\n", .{ rounds, @as(f64, @floatFromInt(out.items.len)) / @as(f64, @floatFromInt(rounds)) });
     std.debug.print("  prompt {d} tokens in {d:.2} s; {d} tokens in {d:.2} s: {d:.2} tok/s\nIDS ", .{ ids.items.len, @as(f64, @floatFromInt(t2 - t1)) / 1e9, out.items.len, @as(f64, @floatFromInt(t3 - t2)) / 1e9, @as(f64, @floatFromInt(out.items.len)) / (@as(f64, @floatFromInt(t3 - t2)) / 1e9) });
     for (out.items) |v| std.debug.print("{d},", .{v});
     std.debug.print("\n", .{});

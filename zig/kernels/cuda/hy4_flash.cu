@@ -321,3 +321,25 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_own(int* picks, float* 
     picks[i] = e;
   }
 }
+
+// A row a block: row r at pos[0] + r reads keys first..p (at most `win`), as a token list for the chunk tiles.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_window(const int* pos, int* tok, int* cnt, int64_t win) {
+  const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
+  const int64_t first = p + 1 >= win ? p + 1 - win : 0, n = p + 1 - first;
+  if (threadIdx.x == 0) cnt[r] = (int)n;
+  for (int64_t j = threadIdx.x; j < win; j += blockDim.x) tok[r * win + j] = j < n ? (int)(first + j) : 0;
+}
+
+// Rows [rows][w] bf16 into the cache at rows pos[0].. (a graph replays this at any position).
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_put(__nv_bfloat16* cache, const __nv_bfloat16* rows,
+                                                            const int* pos, int64_t w) {
+  const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
+  for (int64_t j = threadIdx.x; j < w; j += blockDim.x) cache[p * w + j] = rows[r * w + j];
+}
+
+// DFly's fusion: x = bf16(x + gate fused) over n values (gate bf16, fused fp32).
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_fuse(__nv_bfloat16* x, const float* fused,
+                                                             const __nv_bfloat16* gate, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(gate[i]) * fused[i]);
+}

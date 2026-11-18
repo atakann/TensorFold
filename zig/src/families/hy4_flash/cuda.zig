@@ -6,6 +6,8 @@ const cuda = @import("cuda");
 pub const engram = @import("engram.zig");
 /// The model on one GPU: weights, latent caches, a chunk of rows a step.
 pub const engine = @import("engine.zig");
+/// The DFly drafter on the engine's caches.
+pub const dfly = @import("dfly.zig");
 pub const config = @import("config.zig");
 
 const Stream = cuda.Stream;
@@ -35,6 +37,9 @@ pub const Kernels = struct {
     add32_fn: Function,
     addb_fn: Function,
     own_fn: Function,
+    window_fn: Function,
+    put_fn: Function,
+    fuse_fn: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -61,6 +66,9 @@ pub const Kernels = struct {
             .add32_fn = try mod.function("tf_hy4_add32"),
             .addb_fn = try mod.function("tf_hy4_addb"),
             .own_fn = try mod.function("tf_hy4_own"),
+            .window_fn = try mod.function("tf_hy4_window"),
+            .put_fn = try mod.function("tf_hy4_put"),
+            .fuse_fn = try mod.function("tf_hy4_fuse"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -151,6 +159,27 @@ pub const Kernels = struct {
         var a: Args = .{};
         inline for (.{ picks, wts, i64of(n), @as(c_int, @intCast(lo)), @as(c_int, @intCast(count)) }) |v| a.add(v);
         try cuda.launch.launch(k.own_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// Each row's last `win` keys (rows at device pos[0] + r) as a token list [rows][win] and counts [rows].
+    pub fn window(k: *const Kernels, s: Stream, pos: u64, tok: u64, cnt: u64, rows: usize, win: usize) !void {
+        var a: Args = .{};
+        inline for (.{ pos, tok, cnt, i64of(win) }) |v| a.add(v);
+        try cuda.launch.launch(k.window_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// rows [n][w] bf16 into `cache` at rows pos[0].. (device position).
+    pub fn put(k: *const Kernels, s: Stream, cache: u64, rows: u64, pos: u64, n: usize, w: usize) !void {
+        var a: Args = .{};
+        inline for (.{ cache, rows, pos, i64of(w) }) |v| a.add(v);
+        try cuda.launch.launch(k.put_fn, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// x bf16 = x + gate fused (DFly's fusion of the anchor row with the target's hidden state).
+    pub fn fuse(k: *const Kernels, s: Stream, x: u64, fused: u64, gate: u64, n: usize) !void {
+        var a: Args = .{};
+        inline for (.{ x, fused, gate, i64of(n) }) |v| a.add(v);
+        try cuda.launch.launch(k.fuse_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// a fp32 += b bf16 over n values.
