@@ -31,17 +31,24 @@ pub const Kernels = struct {
     lane: cuda.qmmf.Lane,
     packer: cuda.modelopt.Packer,
     embed: cuda.embed_rows.EmbedRows,
+    /// GLM's top-512 pool selection (radix select, ties to the lower index), for the indexer's groups.
+    sel_mod: cuda.Module,
+    select: cuda.Function,
+    select_wide: cuda.Function,
 
     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
         var mod = try cuda.Module.load(d, cuda.kernels.experts);
         errdefer mod.unload();
+        var sel_mod = try cuda.Module.load(d, cuda.kernels.glm_glue);
+        errdefer sel_mod.unload();
         var lane = try cuda.qmmf.Lane.load(d, 12);
         errdefer lane.unload();
         try lane.loadPrompt(d);
-        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d), .embed = try cuda.embed_rows.EmbedRows.load(d) };
+        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d), .embed = try cuda.embed_rows.EmbedRows.load(d), .sel_mod = sel_mod, .select = try sel_mod.function("tf_glm_select_rows"), .select_wide = try sel_mod.function("tf_glm_select_rows_wide") };
     }
 
     pub fn unload(k: *Kernels) void {
+        k.sel_mod.unload();
         k.embed.unload();
         k.packer.unload();
         k.lane.unload();
@@ -55,6 +62,7 @@ pub const Kernels = struct {
 };
 
 const wt = @import("weights.zig");
+const index = @import("index.zig");
 pub const Lin = wt.Lin;
 pub const Attn = wt.Attn;
 pub const Loader = wt.Loader;
@@ -97,6 +105,8 @@ pub const Model = struct {
     tokens: std.ArrayList(i32) = .empty,
     /// A step's inputs on the device: its streams' rows, its first position, 1.0 a row (the one-expert weights).
     pos: u64 = 0,
+    /// pos[0] + 3: the indexer's selection then sees each row's own group, complete or not.
+    pos3: u64 = 0,
     /// The embedding table on the device and the step's token ids (the streams start as copies of their rows).
     table: u64 = 0,
     ids: u64 = 0,
@@ -109,6 +119,12 @@ pub const Model = struct {
     /// Decode steps replayed as CUDA graphs, one a count of the full layers' 512-key chunks (null: not captured).
     graphs: []?Graph = &.{},
     use_graphs: bool = true,
+    /// false: sparse layers attend densely past the recall budget too (checks the indexer against it).
+    use_index: bool = true,
+    /// A check's copy of one layer's recalled groups ([rows][512] int64 at `probe`; 0: none).
+    probe: u64 = 0,
+    probe_layer: usize = 0,
+    at_layer: usize = 0,
     /// Tensor parallel: this rank's heads, experts and Engram tables; partial sums meet in `group`.
     group: ?*const cuda.tp_group.Group = null,
     rank: usize = 0,
@@ -158,6 +174,7 @@ pub const Model = struct {
         m.ids = try l.zeros(context * 4);
         m.anchor = try l.zeros(c.hidden * 2);
         m.pos = try l.zeros(4);
+        m.pos3 = try l.zeros(4);
         const ones = try gpa.alloc(f32, context);
         defer gpa.free(ones);
         @memset(ones, 1);
@@ -311,8 +328,9 @@ pub const Model = struct {
             }
         }.of;
         try view(m, m.ids, n * 4).upload(0, std.mem.sliceAsBytes(ids));
-        const pos_h = [1]i32{@intCast(p0)};
-        try view(m, m.pos, 4).upload(0, std.mem.sliceAsBytes(&pos_h));
+        const pos_h = [2]i32{ @intCast(p0), @intCast(p0 + 3) };
+        try view(m, m.pos, 4).upload(0, std.mem.sliceAsBytes(pos_h[0..1]));
+        try view(m, m.pos3, 4).upload(0, std.mem.sliceAsBytes(pos_h[1..2]));
         const hash = try m.gpa.alloc(i32, n * engram.heads);
         defer m.gpa.free(hash);
         const toks = m.tokens.items;
@@ -361,6 +379,7 @@ pub const Model = struct {
         try m.mark(3, &t);
         for (m.layers, 0..) |*L, i| {
             at = i;
+            m.at_layer = i;
             stage = "engram";
             if (c.engram[i]) try m.engramAdd(if (L.engram) |*e| e else null, n);
             try m.mark(0, &t);
@@ -424,7 +443,10 @@ pub const Model = struct {
         try m.mark(4, &t);
         const keys = p0 + n;
         const win: usize = c.window;
-        const nch: usize = if (a.sliding) (win + 511) / 512 else (keys + 511) / 512;
+        const recall: usize = c.index_topk; // the indexer runs once the keys outgrow it
+        if (a.idx) |ix| try index.keys(m, ix, x, pos, a.inv_freq, n);
+        const indexed = a.idx != null and keys > recall and m.use_index;
+        const nch: usize = if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
         const part: cuda.mla.Partials = .{ .po = try m.zeros(nch * n * H * 512 * 4), .pm = try m.zeros(nch * n * H * 4), .pl = try m.zeros(nch * n * H * 4) };
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sparse.nope + c.sparse.rope)));
         if (a.sliding) {
@@ -432,6 +454,11 @@ pub const Model = struct {
             const cnt = try m.buf(n * 4);
             try k.window(m.s, pos, tok, cnt, n, win);
             try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, tok, cnt, win, part, n, H, scale);
+        } else if (indexed) {
+            const tok = try m.buf(n * recall * 4);
+            const cnt = try m.buf(n * 4);
+            try index.recalled(m, a.idx.?, x, qr, pos, a.inv_freq, (keys + 511) / 512 * 128, n, tok, cnt);
+            try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, tok, cnt, recall, part, n, H, scale);
         } else try m.k.mla.chunks(m.s, qa, cache, pos, part, n, H, nch, scale);
         try m.mark(5, &t);
         const ol = try m.buf(n * H * 512 * 2);

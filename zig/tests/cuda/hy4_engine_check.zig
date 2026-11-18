@@ -60,6 +60,32 @@ fn dflyConfig(gpu: check.Gpu, dir: []const u8, kv: *[8]u32, mask: *u32) !usize {
     return items.len;
 }
 
+/// Layer 0's recalled groups against the reference's, as sets, for the rows past the recall budget.
+fn compareRecall(gpa: std.mem.Allocator, b: cuda.DeviceBuffer, want_t: core.checkpoint.Tensor, n: usize) !void {
+    const got = try gpa.alloc(i64, n * 512);
+    defer gpa.free(got);
+    try b.download(0, std.mem.sliceAsBytes(got));
+    const want: []align(1) const i64 = std.mem.bytesAsSlice(i64, want_t.bytes);
+    var same_rows: usize = 0;
+    var shared: usize = 0;
+    var rows: usize = 0;
+    for (2048..n) |r| {
+        const g = got[r * 512 ..][0..512];
+        const w = want[r * 512 ..][0..512];
+        std.mem.sort(i64, g, {}, std.sort.asc(i64));
+        var hits: usize = 0;
+        for (w) |x| hits += @intFromBool(std.sort.binarySearch(i64, g, x, struct {
+            fn cmp(key: i64, item: i64) std.math.Order {
+                return std.math.order(key, item);
+            }
+        }.cmp) != null);
+        shared += hits;
+        same_rows += @intFromBool(hits == 512);
+        rows += 1;
+    }
+    check.pass("hy4 engine: layer 0's recalled groups past 2048 keys: {d}/{d} rows the same set, {d:.2}% of the groups shared", .{ same_rows, rows, 100.0 * @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(rows * 512)) });
+}
+
 fn ms(ns: i96) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
@@ -95,8 +121,9 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     var group: ?cuda.tp_group.Group = if (world > 1) try cuda.tp_group.Group.open(gpu.d, envInt("TF_TP_RANK", 0), world) else null;
     defer if (group) |*g| g.close();
     const t0 = check.now(gpu.io);
-    var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 1024, if (group) |*g| g else null);
+    var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 4096, if (group) |*g| g else null);
     defer m.close();
+    if (std.c.getenv("TF_HY4_NOINDEX") != null) m.use_index = false;
     std.debug.print("  rank {d} of {d}: opened {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 1e9 });
     const ids: []align(1) const i32 = std.mem.bytesAsSlice(i32, (try ref.get("input_ids")).bytes);
     const n = ids.len;
@@ -108,11 +135,22 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     defer gpa.free(all);
     const tok = try gpa.alloc(i32, n);
     defer gpa.free(tok);
+    const probe_ref = ref.get("recall.0") catch null;
+    var probe = if (probe_ref != null) try cuda.DeviceBuffer.alloc(gpu.d, n * 512 * 8) else null;
+    defer if (probe) |*b| b.free();
+    if (probe) |b| m.probe = b.ptr;
     try m.step(idv, false, tok, all);
+    m.probe = 0;
+    if (probe) |b| try compareRecall(gpa, b, probe_ref.?, n);
     const want = try t.refF32(&ref, "logits", .{});
     var same: usize = 0;
     for (0..n) |r| same += @intFromBool(std.mem.indexOfMax(f32, all[r * V ..][0..V]) == t.argmax(want[r * V ..][0..V]));
     const rel = relRows(all, want);
+    if (n > 2048) {
+        var late: usize = 0;
+        for (2048..n) |r| late += @intFromBool(std.mem.indexOfMax(f32, all[r * V ..][0..V]) == t.argmax(want[r * V ..][0..V]));
+        std.debug.print("  rows past 2048 keys: logits rel err {e:.3}, argmax {d}/{d}\n", .{ relRows(all[2048 * V ..], want[2048 * V ..]), late, n - 2048 });
+    }
     check.pass("hy4 engine: one step of {d} rows: logits rel err {e:.3}, argmax {d}/{d} as the reference", .{ n, rel, same, n });
     try check.expect(rel < 5e-2 and same * 10 >= n * 9, "hy4 engine: one step: rel err {e}, argmax {d}/{d}", .{ rel, same, n });
     // the same prompt again: two chunks, then single decode rows, each row's logits against the one step's

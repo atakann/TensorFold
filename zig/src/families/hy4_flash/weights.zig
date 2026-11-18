@@ -14,7 +14,9 @@ const sliding_theta: f64 = 1e4;
 
 /// A bf16 projection in the lane matmul's layout (rows padded to 128).
 pub const Lin = cuda.qmmf.Weight;
-pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool };
+pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool, idx: ?Indexer = null };
+/// A sparse layer's compressed indexer (replicated on every rank) and its caches: token keys, pooled group keys.
+pub const Indexer = struct { q: Lin, hw: Lin, tk: Lin, tk_norm: u64, wv: u64, wg: u64, ape: u64, k_norm: u64, tk_cache: u64, gk_cache: u64 };
 pub const Moe = struct { router: Lin, bias: u64, down: Lin, up: Lin, routed: cuda.experts.Layer, shared: cuda.experts.Layer, norm: u64 };
 pub const Mlp = union(enum) { dense: struct { t: cuda.experts.Layer, norm: u64 }, moe: Moe };
 pub const Engram = struct { ids: []align(1) const i32, hash: u64, offsets: u64, moduli: [engram.heads]u32, mult: [engram.max_ngram]u64, table: hy4.EngramTable, row_norm: u64, value: u64, value_bias: u64, key: [4]u64, key_bias: [4]u64, mix: hy4.EngramMix };
@@ -170,7 +172,8 @@ pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, 
     const p = "model.layers.{d}.";
     const sliding = c.kinds[i] == .sliding;
     const H_all: usize = c.heads(@intCast(i)).q;
-    const attn = try loadAttn(l, p ++ "self_attn.", .{i}, H_all, sliding, c.q_rank, c.hidden);
+    var attn = try loadAttn(l, p ++ "self_attn.", .{i}, H_all, sliding, c.q_rank, c.hidden);
+    if (!sliding) attn.idx = try loadIndexer(l, i);
     const hd: usize = c.hidden;
     const mp = p ++ "mlp.";
     const di = c.dense_inter / l.world;
@@ -217,4 +220,21 @@ pub fn loadEngram(l: Loader, i: usize, moduli: [engram.heads]u32) !Engram {
         e.key_bias[s] = try l.w(p ++ "key_projs.{d}.bias", .{ i, s });
     }
     return e;
+}
+
+/// The compressed indexer of sparse layer `i`, with caches for `l.context` tokens.
+fn loadIndexer(l: Loader, i: usize) !Indexer {
+    const p = "model.layers.{d}.self_attn.compressed_indexer.";
+    return .{
+        .q = try l.linOf(p ++ "query_projection.weight", .{i}),
+        .hw = try l.linOf(p ++ "head_weight_projection.weight", .{i}),
+        .tk = try l.linOf(p ++ "token_key_projection.weight", .{i}),
+        .tk_norm = try l.w(p ++ "token_key_norm.weight", .{i}),
+        .wv = try l.w(p ++ "key_value_projection.weight", .{i}),
+        .wg = try l.w(p ++ "key_gate_projection.weight", .{i}),
+        .ape = try l.w(p ++ "intra_group_ape", .{i}),
+        .k_norm = try l.w(p ++ "key_norm.weight", .{i}),
+        .tk_cache = try l.zeros(l.context * 128 * 2),
+        .gk_cache = try l.zeros(l.context / 4 * 128 * 2),
+    };
 }

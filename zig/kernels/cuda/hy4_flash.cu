@@ -379,3 +379,114 @@ extern "C" __global__ void tf_hy4_argmax_pick(const float2* all, int world, int6
   }
   ids[r] = __float_as_int(b.y);
 }
+
+namespace hy4_idx {
+constexpr int D = 128, RATIO = 4, HEADS = 16, ROPE = 64;
+}  // namespace hy4_idx
+
+// A row a block of 128: a group its row closes pooled (fp32 gated softmax over 4 slots), normed, roped, into gk.
+extern "C" __global__ void __launch_bounds__(128) tf_hy4_idx_pool(const __nv_bfloat16* tk, __nv_bfloat16* gk,
+                                                                 const int* pos, const float* wv, const float* wg,
+                                                                 const float* ape, const __nv_bfloat16* norm_w,
+                                                                 const float* inv_freq, float eps) {
+  using namespace hy4_idx;
+  __shared__ float x[RATIO][D];
+  __shared__ float red[4];
+  __shared__ float pooled[D];
+  const int64_t p = (int64_t)pos[0] + blockIdx.x;
+  if ((p + 1) % RATIO != 0) return;
+  const int64_t g = p / RATIO;
+  const int d = threadIdx.x;
+  for (int o = 0; o < RATIO; ++o) x[o][d] = __bfloat162float(tk[(g * RATIO + o) * D + d]);
+  __syncthreads();
+  float v[RATIO], gt[RATIO], mx = -INFINITY;
+  for (int o = 0; o < RATIO; ++o) {
+    float a = 0.0f, b = 0.0f;
+    for (int j = 0; j < D; ++j) {
+      a = __fmaf_rn(wv[d * D + j], x[o][j], a);
+      b = __fmaf_rn(wg[d * D + j], x[o][j], b);
+    }
+    v[o] = a;
+    gt[o] = b + ape[o * D + d];
+    mx = fmaxf(mx, gt[o]);
+  }
+  float den = 0.0f, num = 0.0f;
+  for (int o = 0; o < RATIO; ++o) {
+    const float e = __expf(gt[o] - mx);
+    den += e;
+    num = __fmaf_rn(v[o], e, num);
+  }
+  const float y = num / den;
+  float ss = y * y;
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if ((d & 31) == 0) red[d >> 5] = ss;
+  __syncthreads();
+  const float inv = rsqrtf((red[0] + red[1] + red[2] + red[3]) / D + eps);
+  pooled[d] = __bfloat162float(__float2bfloat16_rn(__bfloat162float(norm_w[d]) * (y * inv)));
+  __syncthreads();
+  float out = pooled[d];
+  if (d >= D - ROPE) {
+    const int i = (d - (D - ROPE)) >> 1;
+    float sn, cs;
+    sincosf(__fmul_rn(inv_freq[i], (float)(g * RATIO)), &sn, &cs);
+    const float a = pooled[d & ~1], b = pooled[d | 1];
+    out = (d & 1) ? __fmaf_rn(b, cs, a * sn) : __fmaf_rn(a, cs, -b * sn);
+  }
+  gk[g * D + d] = __float2bfloat16_rn(out);
+}
+
+// Block (row, 32 groups) of 256: sum_h w_h scale relu(q_h . k_g) before the row's group, +inf on it, -inf past it.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_idx_scores(const __nv_bfloat16* q, const float* w,
+                                                                   const __nv_bfloat16* gk, const int* pos, float* out,
+                                                                   int64_t np, float scale) {
+  using namespace hy4_idx;
+  __shared__ float qs[HEADS][D];
+  const int64_t r = blockIdx.x, own = ((int64_t)pos[0] + r) / RATIO;
+  for (int i = threadIdx.x; i < HEADS * D; i += blockDim.x) qs[i / D][i % D] = __bfloat162float(q[r * HEADS * D + i]);
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  for (int j = warp; j < 32; j += 8) {
+    const int64_t g = (int64_t)blockIdx.y * 32 + j;
+    if (g >= np) return;
+    float sc;
+    if (g == own) sc = INFINITY;
+    else if (g > own) sc = -INFINITY;
+    else {
+      float k4[4];
+      for (int c = 0; c < 4; ++c) k4[c] = __bfloat162float(gk[g * D + lane * 4 + c]);
+      sc = 0.0f;
+      for (int h = 0; h < HEADS; ++h) {
+        float dot = 0.0f;
+        for (int c = 0; c < 4; ++c) dot = __fmaf_rn(qs[h][lane * 4 + c], k4[c], dot);
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+        sc = __fmaf_rn(w[r * HEADS + h] * scale, fmaxf(dot, 0.0f), sc);
+      }
+    }
+    if (lane == 0) out[r * np + g] = sc;
+  }
+}
+
+// A row a block of 512: the recalled groups' keys at or before the row's position as a token list, and its count.
+extern "C" __global__ void __launch_bounds__(512) tf_hy4_idx_tokens(const int64_t* sel, const int* pos, int* tok,
+                                                                   int* cnt) {
+  using namespace hy4_idx;
+  __shared__ int sums[16];
+  const int64_t r = blockIdx.x, p = (int64_t)pos[0] + r;
+  const int64_t g = sel[r * 512 + threadIdx.x];
+  int mine = 0;
+  for (int o = 0; o < RATIO; ++o) mine += g >= 0 && g * RATIO + o <= p;
+  int incl = mine;
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int o = 1; o < 32; o <<= 1) {
+    const int v = __shfl_up_sync(0xffffffffu, incl, o);
+    if (lane >= o) incl += v;
+  }
+  if (lane == 31) sums[warp] = incl;
+  __syncthreads();
+  int before = 0;
+  for (int i = 0; i < warp; ++i) before += sums[i];
+  int at = before + incl - mine;
+  for (int o = 0; o < RATIO; ++o)
+    if (g >= 0 && g * RATIO + o <= p) tok[r * 2048 + at++] = (int)(g * RATIO + o);
+  if (threadIdx.x == 511) cnt[r] = at;
+}

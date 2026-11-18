@@ -14,6 +14,7 @@ from safetensors.torch import save_file
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoTokenizer
 
 src, tok_dir, out = sys.argv[1:4]
+ids_file = sys.argv[4] if len(sys.argv) > 4 else None  # comma-separated prompt ids (a long prompt: the indexer)
 E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]).cuda()
 
 where = {}
@@ -101,12 +102,15 @@ msgs = [{"role": "user", "content": "Explain in three short paragraphs why a mix
          "dense model of the same size, and what limits that speed on a machine where the GPU and CPU share memory."}]
 ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt", reasoning_effort="no_think")
 ids = (ids["input_ids"] if not torch.is_tensor(ids) else ids).cuda()
+if ids_file:
+    ids = torch.tensor([[int(v) for v in open(ids_file).read().split(",") if v.strip()]], device="cuda")
 dump = {"input_ids": ids[0].to(torch.int32).cpu().contiguous()}
 for i, layer in enumerate(text.layers):
     if layer.engram_layer is not None:
         e = layer.engram_layer
         dump[f"engram.{i}.hash"] = e.hash_ngrams(text.build_ngram_tokens(ids, None))[0].to(torch.int32).cpu().contiguous()
         dump[f"engram.{i}.mult"] = e.hash_multipliers.cpu().clone()
+text.layers[0].self_attn.compressed_indexer.register_forward_hook(lambda m, a, o: dump.__setitem__("recall.0", o[0].to(torch.int64).cpu().contiguous()))
 layer1 = text.layers[1]
 layer1.engram_layer.register_forward_hook(lambda m, a, o: dump.__setitem__("engram.1.out", o[0].float().cpu().contiguous()))
 layer1.engram_layer.value_proj.register_forward_hook(lambda m, a, o: dump.update({"engram.1.e": a[0][0].float().cpu().contiguous(), "engram.1.value": o[0].float().cpu().contiguous()}))

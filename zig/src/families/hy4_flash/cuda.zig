@@ -42,6 +42,9 @@ pub const Kernels = struct {
     fuse_fn: Function,
     amax_local: Function,
     amax_pick: Function,
+    idx_pool: Function,
+    idx_scores: Function,
+    idx_tokens: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -73,6 +76,9 @@ pub const Kernels = struct {
             .fuse_fn = try mod.function("tf_hy4_fuse"),
             .amax_local = try mod.function("tf_hy4_argmax_local"),
             .amax_pick = try mod.function("tf_hy4_argmax_pick"),
+            .idx_pool = try mod.function("tf_hy4_idx_pool"),
+            .idx_scores = try mod.function("tf_hy4_idx_scores"),
+            .idx_tokens = try mod.function("tf_hy4_idx_tokens"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -200,6 +206,27 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.amax_pick, .{ .grid = .{ .x = cdiv(rows, 128) }, .block = .{ .x = 128 } }, s, &a);
     }
 
+    /// The indexer's group keys: each of `rows` rows (at pos[0]..) that closes its group pools it into gk.
+    pub fn idxPool(k: *const Kernels, s: Stream, tk: u64, gk: u64, pos: u64, w: IdxPool, rows: usize, eps: f32) !void {
+        var a: Args = .{};
+        inline for (.{ tk, gk, pos, w.wv, w.wg, w.ape, w.norm, w.inv_freq, eps }) |v| a.add(v);
+        try cuda.launch.launch(k.idx_pool, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    /// The indexer's scores [rows][np] over the group keys (own group +inf, later ones -inf).
+    pub fn idxScores(k: *const Kernels, s: Stream, q: u64, w: u64, gk: u64, pos: u64, out: u64, rows: usize, np: usize, scale: f32) !void {
+        var a: Args = .{};
+        inline for (.{ q, w, gk, pos, out, i64of(np), scale }) |v| a.add(v);
+        try cuda.launch.launch(k.idx_scores, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(np, 32) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// The recalled groups (int64 [rows][512]) as token lists [rows][2048] and counts [rows].
+    pub fn idxTokens(k: *const Kernels, s: Stream, sel: u64, pos: u64, tok: u64, cnt: u64, rows: usize) !void {
+        var a: Args = .{};
+        inline for (.{ sel, pos, tok, cnt }) |v| a.add(v);
+        try cuda.launch.launch(k.idx_tokens, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, s, &a);
+    }
+
     /// a fp32 += b bf16 over n values.
     pub fn addb(k: *const Kernels, s: Stream, x: u64, b: u64, n: usize) !void {
         var a: Args = .{};
@@ -257,6 +284,8 @@ pub const Kernels = struct {
     }
 };
 
+/// The indexer's pooling weights: value and gate projections and intra_group_ape (fp32), the key norm, rope freqs.
+pub const IdxPool = struct { wv: u64, wg: u64, ape: u64, norm: u64, inv_freq: u64 };
 /// A hyper-connection's fp32 weights: fn [m][4 d], base [m], scale (2 values, the head's 1).
 pub const Hc = struct { fn_: u64, base: u64, scale: u64 };
 /// An Engram table: fp8 rows with bf16 row scales, or bf16 rows (fp8 and scales 0).
