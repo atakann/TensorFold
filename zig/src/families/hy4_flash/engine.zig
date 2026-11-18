@@ -226,7 +226,7 @@ pub const Model = struct {
         t.* = now;
     }
 
-    /// Rows `ids` at tokens.len..: each row's greedy token (or the `last`'s) into `out`, with `logits` their full logits.
+    /// Rows `ids` at tokens.len..: each row's greedy token (or the `last`'s) into `out`, `logits` their full logits.
     pub fn step(m: *Model, ids: []const i32, last: bool, out: []i32, logits: ?[]f32) !void {
         defer m.reset();
         const n = ids.len;
