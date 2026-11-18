@@ -161,6 +161,7 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
     var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 8192, if (group) |*g| g else null);
     defer m.close();
     if (std.c.getenv("TF_HY4_PROF") != null) m.prof = gpu.io;
+    if (std.c.getenv("TF_HY4_NOGRAPH") != null) m.use_graphs = false;
     const t1 = check.now(gpu.io);
     std.debug.print("  rank {d} of {d}: {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
     const V: usize = cfg.text.vocab;

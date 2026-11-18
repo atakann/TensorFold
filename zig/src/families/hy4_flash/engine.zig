@@ -12,6 +12,8 @@ const Bufs = std.ArrayList(cuda.DeviceBuffer);
 
 /// A latent cache row: the 512 normed latent values, then the 64 roped ones (bf16).
 pub const row_width = 576;
+/// A verify block's rows: the last token and DFly's drafts.
+pub const verify_rows = 6;
 const hc_eps: f32 = 1e-6;
 const hc_magnitude: f32 = 2.0;
 /// Engram's nn.RMSNorm(eps=None): the reference matches float32's eps (hy4-real-check).
@@ -28,17 +30,24 @@ pub const Kernels = struct {
     glue: cuda.moe_glue.MoeGlue,
     lane: cuda.qmmf.Lane,
     packer: cuda.modelopt.Packer,
+    embed: cuda.embed_rows.EmbedRows,
+    amod: cuda.Module,
+    argmax_fn: cuda.Function,
 
     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
         var mod = try cuda.Module.load(d, cuda.kernels.experts);
         errdefer mod.unload();
+        var amod = try cuda.Module.load(d, cuda.kernels.torch_argmax);
+        errdefer amod.unload();
         var lane = try cuda.qmmf.Lane.load(d, 12);
         errdefer lane.unload();
         try lane.loadPrompt(d);
-        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d) };
+        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d), .embed = try cuda.embed_rows.EmbedRows.load(d), .amod = amod, .argmax_fn = try amod.function("tf_argmax_rows_i32_kernel") };
     }
 
     pub fn unload(k: *Kernels) void {
+        k.embed.unload();
+        k.amod.unload();
         k.packer.unload();
         k.lane.unload();
         k.glue.unload();
@@ -61,8 +70,10 @@ const Engram = wt.Engram;
 const loadLayer = wt.loadLayer;
 const bf16of = wt.bf16of;
 
-/// A captured decode step and where it leaves its logits.
-const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64 };
+/// Graphs a chunk count holds: a decode row, a verify block, a DFly proposal.
+pub const graph_kinds = 3;
+/// A captured step and where it leaves its result (logits, or DFly's draft ids) and its final-normed rows.
+pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64 };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -90,8 +101,10 @@ pub const Model = struct {
     x: u64 = 0,
     tokens: std.ArrayList(i32) = .empty,
     /// A step's inputs on the device: its streams' rows, its first position, 1.0 a row (the one-expert weights).
-    xin: u64 = 0,
     pos: u64 = 0,
+    /// The embedding table on the device and the step's token ids (the streams start as copies of their rows).
+    table: u64 = 0,
+    ids: u64 = 0,
     /// The last step's final-normed rows (before the head) and a kept copy of one of them (DFly's target hidden).
     hn: u64 = 0,
     anchor: u64 = 0,
@@ -139,14 +152,15 @@ pub const Model = struct {
             ck.release(); // the layer's file pages are on the device now: give them back
             std.log.info("hy4: layer {d} of {d} on the GPU", .{ i + 1, c.layers });
         }
-        m.xin = try l.zeros(context * c.hc * c.hidden * 2);
+        m.table = try l.up(m.embed);
+        m.ids = try l.zeros(context * 4);
         m.anchor = try l.zeros(c.hidden * 2);
         m.pos = try l.zeros(4);
         const ones = try gpa.alloc(f32, context);
         defer gpa.free(ones);
         @memset(ones, 1);
         m.ones = try l.up(std.mem.sliceAsBytes(ones));
-        m.graphs = try gpa.alloc(?Graph, context / 512 + 2);
+        m.graphs = try gpa.alloc(?Graph, (context / 512 + 2) * graph_kinds);
         @memset(m.graphs, null);
         return m;
     }
@@ -221,8 +235,8 @@ pub const Model = struct {
         errdefer m.tokens.shrinkRetainingCapacity(p0);
         try m.inputs(ids, p0);
         const rows = if (last) 1 else n;
-        const graph = n == 1 and m.use_graphs and m.prof == null;
-        const logits = if (graph) try m.replay(p0) else try m.compute(n, p0, last);
+        const kind: ?usize = if (n == 1 and last) 0 else if (n == verify_rows and !last) 1 else null;
+        const logits = if (kind != null and m.use_graphs and m.prof == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
         try m.s.synchronize();
         try cuda.memory.download(m.d, logits, std.mem.sliceAsBytes(out[0 .. rows * c.vocab]));
     }
@@ -233,22 +247,49 @@ pub const Model = struct {
         try (cuda.DeviceBuffer{ .d = m.d, .ptr = m.anchor, .len = hd * 2, .borrowed = true }).copyFrom(0, m.hn + r * hd * 2, hd * 2, m.s.handle);
     }
 
+    /// fp32 logits [rows][vocab] to each row's first maximum (int32 at `out`, torch.argmax's rule).
+    pub fn argmax(m: *Model, logits: u64, rows: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(out);
+        for ([_]usize{ rows, m.c.vocab, m.c.vocab }) |v| a.add(@as(i64, @intCast(v)));
+        a.add(@as(i32, 1));
+        try cuda.launch.launch(m.k.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, m.s, &a);
+    }
+
+    /// The graph under `key`, captured from `ctx.run(m)` on its first use (its scratch from the step's blocks).
+    pub fn graphed(m: *Model, key: usize, ctx: anytype) !Graph {
+        if (m.graphs[key] == null) {
+            if (m.scratch.items.len == 0) _ = try ctx.run(m); // the scratch's blocks exist before a capture
+            try m.s.synchronize();
+            m.reset();
+            try cuda.graph.beginCapture(m.s, .relaxed);
+            const out = ctx.run(m) catch |e| {
+                var g = cuda.graph.endCapture(m.s) catch return e;
+                g.deinit();
+                return e;
+            };
+            var g = try cuda.graph.endCapture(m.s);
+            defer g.deinit();
+            const exec = try g.instantiate();
+            try exec.upload(m.s);
+            m.graphs[key] = .{ .exec = exec, .logits = out, .hn = m.hn };
+        }
+        const g = m.graphs[key].?;
+        try g.exec.launchOn(m.s);
+        m.hn = g.hn;
+        return g;
+    }
+
     /// The step's inputs into their device buffers: the streams' rows, the position, each Engram layer's hash ids.
     fn inputs(m: *Model, ids: []const i32, p0: usize) !void {
-        const c = m.c;
-        const hd: usize = c.hidden;
         const n = ids.len;
-        const x0 = try m.gpa.alloc(u8, n * c.hc * hd * 2);
-        defer m.gpa.free(x0);
-        for (ids, 0..) |id, r| for (0..c.hc) |s| {
-            @memcpy(x0[(r * c.hc + s) * hd * 2 ..][0 .. hd * 2], m.embed[@as(usize, @intCast(id)) * hd * 2 ..][0 .. hd * 2]);
-        };
         const view = struct {
             fn of(mm: *Model, p: u64, len: usize) cuda.DeviceBuffer {
                 return .{ .d = mm.d, .ptr = p, .len = len, .borrowed = true };
             }
         }.of;
-        try view(m, m.xin, x0.len).upload(0, x0);
+        try view(m, m.ids, n * 4).upload(0, std.mem.sliceAsBytes(ids));
         const pos_h = [1]i32{@intCast(p0)};
         try view(m, m.pos, 4).upload(0, std.mem.sliceAsBytes(&pos_h));
         const hash = try m.gpa.alloc(i32, n * engram.heads);
@@ -271,29 +312,18 @@ pub const Model = struct {
         };
     }
 
-    /// The decode row's graph at this many full-layer chunks, captured now if it is not yet.
-    fn replay(m: *Model, p0: usize) !u64 {
-        const nch = (p0 + 1 + 511) / 512;
-        if (m.graphs[nch] == null) {
-            if (m.scratch.items.len == 0) _ = try m.compute(1, p0, true); // the scratch's blocks exist before a capture
-            try m.s.synchronize();
-            m.reset();
-            try cuda.graph.beginCapture(m.s, .relaxed);
-            const logits = m.compute(1, p0, true) catch |e| {
-                var g = cuda.graph.endCapture(m.s) catch return e;
-                g.deinit();
-                return e;
-            };
-            var g = try cuda.graph.endCapture(m.s);
-            defer g.deinit();
-            const exec = try g.instantiate();
-            try exec.upload(m.s);
-            m.graphs[nch] = .{ .exec = exec, .logits = logits, .hn = m.hn };
-        }
-        const g = m.graphs[nch].?;
-        try g.exec.launchOn(m.s);
-        m.hn = g.hn;
-        return g.logits;
+    /// The step's graph (a decode row or a verify block) at this many full-layer chunks.
+    fn replay(m: *Model, kind: usize, p0: usize, n: usize, last: bool) !u64 {
+        const Run = struct {
+            p0: usize,
+            n: usize,
+            last: bool,
+            pub fn run(r: @This(), mm: *Model) !u64 {
+                return mm.compute(r.n, r.p0, r.last);
+            }
+        };
+        const nch = (p0 + n + 511) / 512;
+        return (try m.graphed(nch * graph_kinds + kind, Run{ .p0 = p0, .n = n, .last = last })).logits;
     }
 
     /// Rows p0..p0+n through every layer from the input buffers: the logits' device rows (every row, or the last).
@@ -302,7 +332,7 @@ pub const Model = struct {
         const c = m.c;
         const hd: usize = c.hidden;
         m.x = try m.buf(n * c.hc * hd * 2);
-        try (cuda.DeviceBuffer{ .d = m.d, .ptr = m.x, .len = n * c.hc * hd * 2, .borrowed = true }).copyFrom(0, m.xin, n * c.hc * hd * 2, m.s.handle);
+        try m.k.embed.bf16Copies(m.s, m.ids, m.table, m.x, n, hd, c.hc);
         var stage: []const u8 = "embed";
         var at: usize = 0;
         errdefer std.log.err("hy4 step: failed in layer {d}'s {s} ({d} rows at {d})", .{ at, stage, n, p0 });

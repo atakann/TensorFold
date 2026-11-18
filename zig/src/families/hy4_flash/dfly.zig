@@ -25,6 +25,9 @@ pub const Draft = struct {
     c_down: Lin,
     mask: i32,
     pos: u64,
+    /// The block's ids on the device (the last token, then masks) and the drafts a proposal leaves.
+    ids: u64,
+    out: u64,
 
     /// The checkpoint's model.dfly_layers.* onto the device: attention heads, the FFN's width cut to this rank's.
     pub fn load(l: engine.Loader, gpa: std.mem.Allocator, kv_layers: []const u32, mask: u32, q_rank: usize, hd: usize) !Draft {
@@ -59,6 +62,12 @@ pub const Draft = struct {
             .c_down = try l.linOf(p ++ "hidden_correction.down_proj.weight", .{}),
             .mask = @intCast(mask),
             .pos = try l.zeros(4),
+            .ids = blk: {
+                var ids: [width]i32 = @splat(@intCast(mask));
+                ids[0] = 0;
+                break :blk try l.up(std.mem.sliceAsBytes(&ids));
+            },
+            .out = try l.zeros(drafts * 4),
         };
     }
 
@@ -82,20 +91,37 @@ pub const Draft = struct {
 
     /// `drafts` tokens after `t` (next at tokens.len) from m.anchor; the block's rows go into the target's caches.
     pub fn propose(d: *Draft, m: *Model, t: i32, out: *[drafts]i32) !void {
-        m.reset();
-        defer m.reset();
-        const c = m.c;
-        const hd: usize = c.hidden;
         const P = m.tokens.items.len;
         if (P + width > m.context) return error.PastContext;
-        const s = m.s;
-        const k = &m.k.k;
-        var ids: [width]i32 = @splat(d.mask);
-        ids[0] = t;
-        const x = try m.buf(width * hd * 2);
-        try d.embedRows(m, &ids, x);
+        const t_h = [1]i32{t};
+        try (cuda.DeviceBuffer{ .d = m.d, .ptr = d.ids, .len = 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(&t_h));
         const pos_h = [1]i32{@intCast(P)};
         try (cuda.DeviceBuffer{ .d = m.d, .ptr = d.pos, .len = 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(&pos_h));
+        const Run = struct {
+            d: *Draft,
+            P: usize,
+            pub fn run(r: @This(), mm: *Model) !u64 {
+                return r.d.body(mm, r.P);
+            }
+        };
+        const nch = (P + width + 511) / 512;
+        if (m.use_graphs) {
+            _ = try m.graphed(nch * engine.graph_kinds + 2, Run{ .d = d, .P = P });
+        } else _ = try d.body(m, P);
+        try m.s.synchronize();
+        try cuda.memory.download(m.d, d.out, std.mem.sliceAsBytes(out));
+        m.reset();
+    }
+
+    /// The proposal on the device alone (a graph replays it): the block's layers, then each draft's head and argmax.
+    fn body(d: *Draft, m: *Model, P: usize) !u64 {
+        m.reset();
+        const c = m.c;
+        const hd: usize = c.hidden;
+        const s = m.s;
+        const k = &m.k.k;
+        const x = try m.buf(width * hd * 2);
+        try m.k.embed.bf16(s, d.ids, m.table, x, width, hd);
         // the anchor row fused with the target's hidden state
         const cat = try m.buf(2 * hd * 2);
         try k.rmsNorm16(s, x, hd, d.enorm, cat, 2 * hd, 1, hd, c.eps);
@@ -123,15 +149,12 @@ pub const Draft = struct {
         }
         const hidden = try m.buf(width * hd * 2);
         try k.rmsNorm(s, r, hd, d.norm, hidden, hd, width, hd, c.eps);
-        // one token at a time: each row corrected by the token before it, then the target's head
+        // one token at a time: each row corrected by the token before it, then the target's head and argmax
         const ci = d.c_down.k;
         const prev = try m.buf(hd * 2);
         const logits = try m.buf(c.vocab * 4);
-        const row = try m.gpa.alloc(f32, c.vocab);
-        defer m.gpa.free(row);
-        var last = t;
         for (0..drafts) |j| {
-            try d.embedRows(m, &.{last}, prev);
+            try m.k.embed.bf16(s, if (j == 0) d.ids else d.out + (j - 1) * 4, m.table, prev, 1, hd);
             const h = hidden + (j + 1) * hd * 2;
             try k.rmsNorm16(s, h, hd, d.c_hnorm, cat, 2 * hd, 1, hd, c.eps);
             try k.rmsNorm16(s, prev, hd, d.c_enorm, cat + hd * 2, 2 * hd, 1, hd, c.eps);
@@ -145,20 +168,8 @@ pub const Draft = struct {
             const ch = try m.buf(hd * 2);
             try k.castRows(s, corr, hd, ch, hd, 1, hd);
             try m.proj(m.lm, ch, hd, logits, 1);
-            try s.synchronize();
-            try cuda.memory.download(m.d, logits, std.mem.sliceAsBytes(row));
-            last = @intCast(std.mem.indexOfMax(f32, row));
-            out[j] = last;
+            try m.argmax(logits, 1, d.out + j * 4);
         }
-    }
-
-    /// The tokens' embedding rows (bf16, the target's table) into `x`.
-    fn embedRows(d: *Draft, m: *Model, ids: []const i32, x: u64) !void {
-        _ = d;
-        const hd: usize = m.c.hidden;
-        const h = try m.gpa.alloc(u8, ids.len * hd * 2);
-        defer m.gpa.free(h);
-        for (ids, 0..) |id, r| @memcpy(h[r * hd * 2 ..][0 .. hd * 2], m.embed[@as(usize, @intCast(id)) * hd * 2 ..][0 .. hd * 2]);
-        try (cuda.DeviceBuffer{ .d = m.d, .ptr = x, .len = h.len, .borrowed = true }).upload(0, h);
+        return d.out;
     }
 };
