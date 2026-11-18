@@ -40,6 +40,8 @@ pub const Kernels = struct {
     window_fn: Function,
     put_fn: Function,
     fuse_fn: Function,
+    amax_local: Function,
+    amax_pick: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -69,6 +71,8 @@ pub const Kernels = struct {
             .window_fn = try mod.function("tf_hy4_window"),
             .put_fn = try mod.function("tf_hy4_put"),
             .fuse_fn = try mod.function("tf_hy4_fuse"),
+            .amax_local = try mod.function("tf_hy4_argmax_local"),
+            .amax_pick = try mod.function("tf_hy4_argmax_pick"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -180,6 +184,20 @@ pub const Kernels = struct {
         var a: Args = .{};
         inline for (.{ x, fused, gate, i64of(n) }) |v| a.add(v);
         try cuda.launch.launch(k.fuse_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// Each row's first maximum of a vocabulary slice's n logits as (value, index + offset) pairs [rows].
+    pub fn argmaxLocal(k: *const Kernels, s: Stream, logits: u64, rows: usize, n: usize, offset: usize, out: u64) !void {
+        var a: Args = .{};
+        inline for (.{ logits, i64of(n), i64of(offset), out }) |v| a.add(v);
+        try cuda.launch.launch(k.amax_local, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
+    }
+
+    /// Each row's token over the ranks' pairs [world][rows], int32 into `ids`.
+    pub fn argmaxPick(k: *const Kernels, s: Stream, all: u64, world: usize, rows: usize, ids: u64) !void {
+        var a: Args = .{};
+        inline for (.{ all, @as(c_int, @intCast(world)), i64of(rows), ids }) |v| a.add(v);
+        try cuda.launch.launch(k.amax_pick, .{ .grid = .{ .x = cdiv(rows, 128) }, .block = .{ .x = 128 } }, s, &a);
     }
 
     /// a fp32 += b bf16 over n values.

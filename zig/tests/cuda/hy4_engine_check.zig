@@ -106,7 +106,9 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     for (idv, ids) |*o, v| o.* = v;
     const all = try gpa.alloc(f32, n * V);
     defer gpa.free(all);
-    try m.step(idv, false, all);
+    const tok = try gpa.alloc(i32, n);
+    defer gpa.free(tok);
+    try m.step(idv, false, tok, all);
     const want = try t.refF32(&ref, "logits", .{});
     var same: usize = 0;
     for (0..n) |r| same += @intFromBool(std.mem.indexOfMax(f32, all[r * V ..][0..V]) == t.argmax(want[r * V ..][0..V]));
@@ -123,7 +125,8 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     var flips: usize = 0;
     for (0..cuts.len + 5) |j| {
         const end = if (j < cuts.len) cuts[j] else at + 1;
-        try m.step(idv[at..end], true, row);
+        var one: [1]i32 = undefined;
+        try m.step(idv[at..end], true, &one, row);
         const r = relRows(row, all[(end - 1) * V ..][0..V]);
         worst = @max(worst, r);
         flips += @intFromBool(std.mem.indexOfMax(f32, row) != std.mem.indexOfMax(f32, all[(end - 1) * V ..][0..V]));
@@ -164,10 +167,7 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
     if (std.c.getenv("TF_HY4_NOGRAPH") != null) m.use_graphs = false;
     const t1 = check.now(gpu.io);
     std.debug.print("  rank {d} of {d}: {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
-    const V: usize = cfg.text.vocab;
     const D = hy4.dfly.drafts;
-    const rows = try gpa.alloc(f32, (D + 1) * V);
-    defer gpa.free(rows);
     // TF_HY4_DFLY=1: the checkpoint's DFly drafter proposes, one target step verifies the block
     var draft: ?hy4.dfly.Draft = null;
     if (std.c.getenv("TF_HY4_DFLY") != null) {
@@ -177,12 +177,13 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
         const l: engine.Loader = .{ .gpa = gpa, .d = gpu.d, .ck = &ck, .bufs = &m.weights, .rank = m.rank, .world = m.world, .s = s, .packer = &k.packer, .context = m.context };
         draft = try hy4.dfly.Draft.load(l, gpa, kv[0..n_kv], mask, cfg.text.q_rank, cfg.text.hidden);
     }
-    try m.step(ids.items, true, rows);
+    var tok: [D + 1]i32 = undefined;
+    try m.step(ids.items, true, &tok, null);
     try m.keepRow(0);
     const t2 = check.now(gpu.io);
     var out: std.ArrayList(i32) = .empty;
     defer out.deinit(gpa);
-    var next: i32 = @intCast(std.mem.indexOfMax(f32, rows[0..V]));
+    var next: i32 = tok[0];
     var rounds: usize = 0;
     const eos: i32 = @intCast(cfg.eos);
     gen: while (out.items.len < steps) {
@@ -195,9 +196,9 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
             var block: [D + 1]i32 = undefined;
             block[0] = next;
             @memcpy(block[1..], &d);
-            try m.step(&block, false, rows);
+            try m.step(&block, false, &tok, null);
             var a: usize = 0;
-            while (a < D and std.mem.indexOfMax(f32, rows[a * V ..][0..V]) == @as(usize, @intCast(d[a]))) a += 1;
+            while (a < D and tok[a] == d[a]) a += 1;
             m.tokens.shrinkRetainingCapacity(p0 + 1 + a);
             try m.keepRow(a);
             rounds += 1;
@@ -205,10 +206,10 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
                 try out.append(gpa, v);
                 if (v == eos) break :gen;
             }
-            next = @intCast(std.mem.indexOfMax(f32, rows[a * V ..][0..V]));
+            next = tok[a];
         } else {
-            try m.step(&.{next}, true, rows);
-            next = @intCast(std.mem.indexOfMax(f32, rows[0..V]));
+            try m.step(&.{next}, true, &tok, null);
+            next = tok[0];
         }
     }
     const t3 = check.now(gpu.io);

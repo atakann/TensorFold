@@ -343,3 +343,39 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_fuse(__nv_bfloat16* x, 
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(gate[i]) * fused[i]);
 }
+
+// A row a block of 1024: the row's first maximum of n logits as (value, index + offset) for a vocabulary slice.
+extern "C" __global__ void __launch_bounds__(1024) tf_hy4_argmax_local(const float* logits, int64_t n, int64_t offset,
+                                                                      float2* out) {
+  __shared__ float sv[32];
+  __shared__ int si[32];
+  const float* r = logits + blockIdx.x * n;
+  float bv = -INFINITY;
+  int bi = 0x7fffffff;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x)
+    if (r[i] > bv) bv = r[i], bi = (int)i;
+  for (int o = 16; o > 0; o >>= 1) {
+    const float v = __shfl_xor_sync(0xffffffffu, bv, o);
+    const int j = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (v > bv || (v == bv && j < bi)) bv = v, bi = j;
+  }
+  if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = bv, si[threadIdx.x >> 5] = bi;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int w = 1; w < (int)(blockDim.x >> 5); ++w)
+      if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) bv = sv[w], bi = si[w];
+    out[blockIdx.x] = make_float2(bv, __int_as_float(bi + (int)offset));
+  }
+}
+
+// Each row's pick over the ranks' (value, index) pairs [world][rows]: the larger value, the lower index on a tie.
+extern "C" __global__ void tf_hy4_argmax_pick(const float2* all, int world, int64_t rows, int* ids) {
+  const int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  float2 b = all[r];
+  for (int w = 1; w < world; ++w) {
+    const float2 c = all[w * rows + r];
+    if (c.x > b.x || (c.x == b.x && __float_as_int(c.y) < __float_as_int(b.y))) b = c;
+  }
+  ids[r] = __float_as_int(b.y);
+}

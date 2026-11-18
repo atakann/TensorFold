@@ -152,7 +152,6 @@ pub const Draft = struct {
         // one token at a time: each row corrected by the token before it, then the target's head and argmax
         const ci = d.c_down.k;
         const prev = try m.buf(hd * 2);
-        const logits = try m.buf(c.vocab * 4);
         for (0..drafts) |j| {
             try m.k.embed.bf16(s, if (j == 0) d.ids else d.out + (j - 1) * 4, m.table, prev, 1, hd);
             const h = hidden + (j + 1) * hd * 2;
@@ -167,8 +166,7 @@ pub const Draft = struct {
             try k.addb(s, corr, h, hd);
             const ch = try m.buf(hd * 2);
             try k.castRows(s, corr, hd, ch, hd, 1, hd);
-            try m.proj(m.lm, ch, hd, logits, 1);
-            try m.argmax(logits, 1, d.out + j * 4);
+            try m.headIds(ch, 1, d.out + j * 4);
         }
         return d.out;
     }

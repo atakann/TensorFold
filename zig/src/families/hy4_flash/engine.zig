@@ -31,23 +31,18 @@ pub const Kernels = struct {
     lane: cuda.qmmf.Lane,
     packer: cuda.modelopt.Packer,
     embed: cuda.embed_rows.EmbedRows,
-    amod: cuda.Module,
-    argmax_fn: cuda.Function,
 
     pub fn load(d: *const cuda.Driver, sms: usize) !Kernels {
         var mod = try cuda.Module.load(d, cuda.kernels.experts);
         errdefer mod.unload();
-        var amod = try cuda.Module.load(d, cuda.kernels.torch_argmax);
-        errdefer amod.unload();
         var lane = try cuda.qmmf.Lane.load(d, 12);
         errdefer lane.unload();
         try lane.loadPrompt(d);
-        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d), .embed = try cuda.embed_rows.EmbedRows.load(d), .amod = amod, .argmax_fn = try amod.function("tf_argmax_rows_i32_kernel") };
+        return .{ .k = try hy4.Kernels.load(d), .mla = try cuda.mla.Mla.load(d), .dense = try cuda.dense_rows.DenseRows.load(d), .mod = mod, .router = try cuda.grouped.Router.resolve(mod), .x = try X.load(d, sms), .glue = try cuda.moe_glue.MoeGlue.load(d), .lane = lane, .packer = try cuda.modelopt.Packer.load(d), .embed = try cuda.embed_rows.EmbedRows.load(d) };
     }
 
     pub fn unload(k: *Kernels) void {
         k.embed.unload();
-        k.amod.unload();
         k.packer.unload();
         k.lane.unload();
         k.glue.unload();
@@ -73,7 +68,7 @@ const bf16of = wt.bf16of;
 /// Graphs a chunk count holds: a decode row, a verify block, a DFly proposal.
 pub const graph_kinds = 3;
 /// A captured step and where it leaves its result (logits, or DFly's draft ids) and its final-normed rows.
-pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64 };
+pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64, local: u64 };
 
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -108,6 +103,8 @@ pub const Model = struct {
     /// The last step's final-normed rows (before the head) and a kept copy of one of them (DFly's target hidden).
     hn: u64 = 0,
     anchor: u64 = 0,
+    /// The last step's logits of this rank's vocabulary slice [rows][vocab / world] (checks gather them).
+    local: u64 = 0,
     ones: u64 = 0,
     /// Decode steps replayed as CUDA graphs, one a count of the full layers' 512-key chunks (null: not captured).
     graphs: []?Graph = &.{},
@@ -133,12 +130,17 @@ pub const Model = struct {
         m.embed = (try l.tensor("model.embed_tokens.weight", .{})).bytes;
         m.norm = try l.w("model.norm.weight", .{});
         m.head = try l.hc("model.hc_head.hc_head", .{});
+        // the head's rows by vocabulary slice: each rank's logits, then its argmax pairs gathered
         const lm = try l.tensor("lm_head.weight", .{});
-        m.lm = if (lm.dtype == .bf16) try l.lin(lm.bytes, lm.dim(0), lm.dim(1)) else blk: {
-            const h = try gpa.alloc(u16, lm.numel());
+        if (c.vocab % world != 0) return error.TensorParallelSplit;
+        const vl = c.vocab / world;
+        const per: usize = if (lm.dtype == .bf16) 2 else 4;
+        const mine = lm.bytes[rank * vl * c.hidden * per ..][0 .. vl * c.hidden * per];
+        m.lm = if (lm.dtype == .bf16) try l.lin(mine, vl, c.hidden) else blk: {
+            const h = try gpa.alloc(u16, vl * c.hidden);
             defer gpa.free(h);
-            for (h, 0..) |*o, j| o.* = bf16of(std.mem.bytesAsValue(f32, lm.bytes[j * 4 ..][0..4]).*);
-            break :blk try l.lin(std.mem.sliceAsBytes(h), lm.dim(0), lm.dim(1));
+            for (h, 0..) |*o, j| o.* = bf16of(std.mem.bytesAsValue(f32, mine[j * 4 ..][0..4]).*);
+            break :blk try l.lin(std.mem.sliceAsBytes(h), vl, c.hidden);
         };
         var engram_n: usize = 0;
         for (0..c.layers) |i| {
@@ -224,10 +226,9 @@ pub const Model = struct {
         t.* = now;
     }
 
-    /// Rows `ids` at tokens.len.. through every layer: their logits (or the `last`) into `out`; decode rows by graph.
-    pub fn step(m: *Model, ids: []const i32, last: bool, out: []f32) !void {
+    /// Rows `ids` at tokens.len..: each row's greedy token (or the `last`'s) into `out`, with `logits` their full logits.
+    pub fn step(m: *Model, ids: []const i32, last: bool, out: []i32, logits: ?[]f32) !void {
         defer m.reset();
-        const c = m.c;
         const n = ids.len;
         const p0 = m.tokens.items.len;
         if (p0 + n > m.context) return error.PastContext;
@@ -236,25 +237,44 @@ pub const Model = struct {
         try m.inputs(ids, p0);
         const rows = if (last) 1 else n;
         const kind: ?usize = if (n == 1 and last) 0 else if (n == verify_rows and !last) 1 else null;
-        const logits = if (kind != null and m.use_graphs and m.prof == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
+        const toks = if (kind != null and m.use_graphs and m.prof == null and logits == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
         try m.s.synchronize();
-        try cuda.memory.download(m.d, logits, std.mem.sliceAsBytes(out[0 .. rows * c.vocab]));
+        try cuda.memory.download(m.d, toks, std.mem.sliceAsBytes(out[0..rows]));
+        if (logits) |full| try m.gatherLogits(rows, full);
+    }
+
+    /// The last step's logits of every rank, each row's vocabulary slices in rank order, into `full`.
+    fn gatherLogits(m: *Model, rows: usize, full: []f32) !void {
+        const vl = m.c.vocab / m.world;
+        const all = try m.gpa.alloc(f32, m.world * rows * vl);
+        defer m.gpa.free(all);
+        if (m.group) |g| {
+            const dev = try m.buf(all.len * 4);
+            try g.allGather(m.s, m.local, dev, rows * vl * 4);
+            try m.s.synchronize();
+            try cuda.memory.download(m.d, dev, std.mem.sliceAsBytes(all));
+        } else try cuda.memory.download(m.d, m.local, std.mem.sliceAsBytes(all));
+        for (0..m.world) |w| for (0..rows) |r| @memcpy(full[r * m.c.vocab + w * vl ..][0..vl], all[(w * rows + r) * vl ..][0..vl]);
+    }
+
+    /// The head: this rank's vocabulary slice into `local`, each row's token over all ranks into `ids`.
+    pub fn headIds(m: *Model, hn: u64, rows: usize, ids: u64) !void {
+        const vl = m.c.vocab / m.world;
+        m.local = try m.buf(rows * vl * 4);
+        try m.proj(m.lm, hn, m.c.hidden, m.local, rows);
+        const pairs = try m.buf(rows * 8);
+        try m.k.k.argmaxLocal(m.s, m.local, rows, vl, m.rank * vl, pairs);
+        if (m.group) |g| {
+            const all = try m.buf(m.world * rows * 8);
+            try g.allGather(m.s, pairs, all, rows * 8);
+            try m.k.k.argmaxPick(m.s, all, m.world, rows, ids);
+        } else try m.k.k.argmaxPick(m.s, pairs, 1, rows, ids);
     }
 
     /// Row `r` of the last step's final-normed rows into `anchor` (the step's buffers are still in place).
     pub fn keepRow(m: *Model, r: usize) !void {
         const hd: usize = m.c.hidden;
         try (cuda.DeviceBuffer{ .d = m.d, .ptr = m.anchor, .len = hd * 2, .borrowed = true }).copyFrom(0, m.hn + r * hd * 2, hd * 2, m.s.handle);
-    }
-
-    /// fp32 logits [rows][vocab] to each row's first maximum (int32 at `out`, torch.argmax's rule).
-    pub fn argmax(m: *Model, logits: u64, rows: usize, out: u64) !void {
-        var a: cuda.Args = .{};
-        a.add(logits);
-        a.add(out);
-        for ([_]usize{ rows, m.c.vocab, m.c.vocab }) |v| a.add(@as(i64, @intCast(v)));
-        a.add(@as(i32, 1));
-        try cuda.launch.launch(m.k.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, m.s, &a);
     }
 
     /// The graph under `key`, captured from `ctx.run(m)` on its first use (its scratch from the step's blocks).
@@ -273,11 +293,12 @@ pub const Model = struct {
             defer g.deinit();
             const exec = try g.instantiate();
             try exec.upload(m.s);
-            m.graphs[key] = .{ .exec = exec, .logits = out, .hn = m.hn };
+            m.graphs[key] = .{ .exec = exec, .logits = out, .hn = m.hn, .local = m.local };
         }
         const g = m.graphs[key].?;
         try g.exec.launchOn(m.s);
         m.hn = g.hn;
+        m.local = g.local;
         return g;
     }
 
@@ -367,11 +388,11 @@ pub const Model = struct {
         try m.k.k.hcHead(m.s, xs, m.head, h, rows, hd, c.eps, hc_eps);
         const hn = try m.buf(rows * hd * 2);
         try m.k.k.rmsNorm16(m.s, h, hd, m.norm, hn, hd, rows, hd, c.eps);
-        const logits = try m.buf(rows * c.vocab * 4);
-        try m.proj(m.lm, hn, hd, logits, rows);
+        const toks = try m.buf(rows * 4);
+        try m.headIds(hn, rows, toks);
         try m.mark(3, &t);
         m.hn = hn;
-        return logits;
+        return toks;
     }
 
     /// Rows p0..: latent rows into `cache`, then MLA over it (sliding: the last `window` keys a row as a token list).
