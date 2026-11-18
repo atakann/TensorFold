@@ -91,6 +91,7 @@ pub const window_rows: []const u8 = if (available) &Blob("fatbin_window_rows").b
 pub const window_pages: []const u8 = if (available) &Blob("fatbin_window_pages").bytes else &.{};
 pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes else &.{};
 pub const mla: []const u8 = if (available) &Blob("fatbin_mla").bytes else &.{};
+pub const hy4_flash: []const u8 = if (available) &Blob("fatbin_hy4_flash").bytes else &.{};
 pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
 pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
