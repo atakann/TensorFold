@@ -302,3 +302,9 @@ extern "C" __global__ void tf_hy4_route(const float* logits, const float* bias, 
   }
   for (int k = 0; k < K; ++k) wts[r * K + k] = wts[r * K + k] / (sum + 1e-20f) * scale;
 }
+
+// a += b over n values, a fp32 and b bf16 (the shared expert's bf16 sums into the routed fp32 output).
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_addb(float* a, const __nv_bfloat16* b, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] += __bfloat162float(b[i]);
+}

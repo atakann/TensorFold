@@ -6,13 +6,13 @@ const check = @import("check.zig");
 const hy4 = @import("hy4_flash");
 const engram = hy4.engram;
 
-const hidden = 3072;
-const streams = 4;
-const eps: f32 = 1e-5;
+pub const hidden = 3072;
+pub const streams = 4;
+pub const eps: f32 = 1e-5;
 /// nn.RMSNorm(eps=None) in Engram takes its dtype's eps: the reference runs in float32.
 const eps32: f32 = std.math.floatEps(f32);
 
-const Layer = struct { heads: usize, theta: f64, sliding: bool };
+pub const Layer = struct { heads: usize, theta: f64, sliding: bool };
 const layers = [_]Layer{
     .{ .heads = 32, .theta = 1e7, .sliding = false },
     .{ .heads = 32, .theta = 1e7, .sliding = false },
@@ -27,53 +27,54 @@ const dense_inter = 13824;
 const Bufs = std.ArrayList(cuda.DeviceBuffer);
 
 /// The kernels, the checkpoint and the buffers of the step at hand (freed by `reset`).
-const Ctx = struct {
+pub const Ctx = struct {
     gpu: check.Gpu,
     s: cuda.Stream,
     k: *const hy4.Kernels,
     mla: *const cuda.mla.Mla,
     dense: *const cuda.dense_rows.DenseRows,
     ck: *core.checkpoint.Checkpoint,
+    kinds: []const Layer = &layers,
     bufs: Bufs = .empty,
 
-    fn reset(c: *Ctx) void {
+    pub fn reset(c: *Ctx) void {
         for (c.bufs.items) |*b| b.free();
         c.bufs.clearRetainingCapacity();
     }
 
-    fn deinit(c: *Ctx) void {
+    pub fn deinit(c: *Ctx) void {
         c.reset();
         c.bufs.deinit(c.gpu.gpa);
     }
 
-    fn keep(c: *Ctx, b: cuda.DeviceBuffer) !u64 {
+    pub fn keep(c: *Ctx, b: cuda.DeviceBuffer) !u64 {
         try c.bufs.append(c.gpu.gpa, b);
         return b.ptr;
     }
 
     /// Cleared on the check's stream, so a clear never lands after a launch that wrote the buffer.
-    fn zeros(c: *Ctx, n: usize) !u64 {
+    pub fn zeros(c: *Ctx, n: usize) !u64 {
         var b = try cuda.DeviceBuffer.alloc(c.gpu.d, n);
         errdefer b.free();
         try b.fill8(0, c.s.handle);
         return c.keep(b);
     }
 
-    fn up(c: *Ctx, bytes: []const u8) !u64 {
+    pub fn up(c: *Ctx, bytes: []const u8) !u64 {
         return c.keep(try cuda.DeviceBuffer.fromHost(c.gpu.d, bytes));
     }
 
-    fn tensor(c: *Ctx, comptime fmt: []const u8, args: anytype) !core.checkpoint.Tensor {
+    pub fn tensor(c: *Ctx, comptime fmt: []const u8, args: anytype) !core.checkpoint.Tensor {
         var buf: [200]u8 = undefined;
         return c.ck.get(try std.fmt.bufPrint(&buf, fmt, args));
     }
 
-    fn w(c: *Ctx, comptime fmt: []const u8, args: anytype) !u64 {
+    pub fn w(c: *Ctx, comptime fmt: []const u8, args: anytype) !u64 {
         return c.up((try c.tensor(fmt, args)).bytes);
     }
 
     /// `count` bf16 tensors (the last format argument their index), one after the other as fp32 on the device.
-    fn wf32(c: *Ctx, comptime fmt: []const u8, args: anytype, count: usize) !u64 {
+    pub fn wf32(c: *Ctx, comptime fmt: []const u8, args: anytype, count: usize) !u64 {
         var all: std.ArrayList(f32) = .empty;
         defer all.deinit(c.gpu.gpa);
         for (0..count) |j| {
@@ -84,7 +85,7 @@ const Ctx = struct {
         return c.up(std.mem.sliceAsBytes(all.items));
     }
 
-    fn wf32One(c: *Ctx, comptime fmt: []const u8, args: anytype) !u64 {
+    pub fn wf32One(c: *Ctx, comptime fmt: []const u8, args: anytype) !u64 {
         const v: []align(1) const u16 = std.mem.bytesAsSlice(u16, (try c.tensor(fmt, args)).bytes);
         const f = try c.gpu.gpa.alloc(f32, v.len);
         defer c.gpu.gpa.free(f);
@@ -92,23 +93,23 @@ const Ctx = struct {
         return c.up(std.mem.sliceAsBytes(f));
     }
 
-    fn hc(c: *Ctx, comptime prefix: []const u8, args: anytype) !hy4.Hc {
+    pub fn hc(c: *Ctx, comptime prefix: []const u8, args: anytype) !hy4.Hc {
         return .{ .fn_ = try c.w(prefix ++ "_fn", args), .base = try c.w(prefix ++ "_base", args), .scale = try c.w(prefix ++ "_scale", args) };
     }
 };
 
-fn bf16f(b: u16) f32 {
+pub fn bf16f(b: u16) f32 {
     return @bitCast(@as(u32, b) << 16);
 }
 
-fn tobf16(v: f32) u16 {
+pub fn tobf16(v: f32) u16 {
     const u: u32 = @bitCast(v);
     return @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
 }
 
 /// One layer's attention module: x [rows][hidden] bf16 in, the module's output [rows][hidden] bf16 back.
-fn attend(c: *Ctx, i: usize, x: u64, rows: usize) !u64 {
-    const L = layers[i];
+pub fn attend(c: *Ctx, i: usize, x: u64, rows: usize) !u64 {
+    const L = c.kinds[i];
     const H = L.heads;
     const k = c.k;
     const p = "model.layers.{d}.self_attn.";
@@ -177,7 +178,7 @@ fn attend(c: *Ctx, i: usize, x: u64, rows: usize) !u64 {
 }
 
 /// gate and up of x [rows][k] into gu [rows][2 inter] fp32, then SwiGLU into bf16 [rows][inter].
-fn swigluRows(c: *Ctx, x: u64, kdim: usize, gate: u64, upw: u64, rows: usize, inter: usize, limit: f32) !u64 {
+pub fn swigluRows(c: *Ctx, x: u64, kdim: usize, gate: u64, upw: u64, rows: usize, inter: usize, limit: f32) !u64 {
     const gu = try c.zeros(rows * 2 * inter * 4);
     try c.dense.rows(c.s, x, kdim, gate, gu, 2 * inter, rows, inter, kdim);
     try c.dense.rows(c.s, x, kdim, upw, gu + inter * 4, 2 * inter, rows, inter, kdim);
@@ -329,7 +330,7 @@ fn engramAdd(c: *Ctx, fwd: *core.checkpoint.Checkpoint, i: usize, x: u64, ids: [
 }
 
 /// Relative error of bf16 (or fp32) values against the reference's fp32.
-fn relErr(c: *Ctx, p: u64, f32s: bool, want: []align(1) const f32) !f64 {
+pub fn relErr(c: *Ctx, p: u64, f32s: bool, want: []align(1) const f32) !f64 {
     try c.s.synchronize();
     const n = want.len;
     const bytes = try c.gpu.gpa.alloc(u8, n * @as(usize, if (f32s) 4 else 2));
@@ -346,12 +347,12 @@ fn relErr(c: *Ctx, p: u64, f32s: bool, want: []align(1) const f32) !f64 {
     return @sqrt(dd / ww);
 }
 
-fn refF32(ref: *core.checkpoint.Checkpoint, comptime fmt: []const u8, args: anytype) ![]align(1) const f32 {
+pub fn refF32(ref: *core.checkpoint.Checkpoint, comptime fmt: []const u8, args: anytype) ![]align(1) const f32 {
     var buf: [64]u8 = undefined;
     return std.mem.bytesAsSlice(f32, (try ref.get(try std.fmt.bufPrint(&buf, fmt, args))).bytes);
 }
 
-fn argmax(v: []align(1) const f32) usize {
+pub fn argmax(v: []align(1) const f32) usize {
     var best: usize = 0;
     for (v, 0..) |x, j| if (x > v[best]) {
         best = j;
@@ -439,6 +440,7 @@ fn attnCheck(c: *Ctx, ref: *core.checkpoint.Checkpoint) !void {
 
 /// The hy4- commands: hy4-attn-check TINY ATTN and hy4-forward-check TINY FWD (the tiny checkpoint, then dumps).
 pub fn run(gpu: check.Gpu, cmd: []const u8, rest: []const []const u8) !void {
+    if (std.mem.eql(u8, cmd, "hy4-real-check")) return @import("hy4_real_check.zig").run(gpu, rest);
     const attn = std.mem.eql(u8, cmd, "hy4-attn-check");
     if (!(attn or std.mem.eql(u8, cmd, "hy4-forward-check")) or rest.len != 2) {
         std.debug.print("usage: hy4-attn-check TINY ATTN | hy4-forward-check TINY FWD   a tiny Hy4-flash against the reference\n", .{});

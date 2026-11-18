@@ -30,6 +30,7 @@ pub const Kernels = struct {
     bias_fn: Function,
     add16_fn: Function,
     add32_fn: Function,
+    addb_fn: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -54,6 +55,7 @@ pub const Kernels = struct {
             .bias_fn = try mod.function("tf_hy4_bias"),
             .add16_fn = try mod.function("tf_hy4_add16"),
             .add32_fn = try mod.function("tf_hy4_add32"),
+            .addb_fn = try mod.function("tf_hy4_addb"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -137,6 +139,13 @@ pub const Kernels = struct {
         var a: Args = .{};
         inline for (.{ x, f, i64of(n) }) |v| a.add(v);
         try cuda.launch.launch(k.add32_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// a fp32 += b bf16 over n values.
+    pub fn addb(k: *const Kernels, s: Stream, x: u64, b: u64, n: usize) !void {
+        var a: Args = .{};
+        inline for (.{ x, b, i64of(n) }) |v| a.add(v);
+        try cuda.launch.launch(k.addb_fn, .{ .grid = .{ .x = cdiv(n, 256) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// out [rows][I] bf16 = silu(gate) up from gu [rows][2I] fp32 (gate first), clamped at limit (0: none).
