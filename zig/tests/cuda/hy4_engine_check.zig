@@ -112,3 +112,53 @@ pub fn run(gpu: check.Gpu, rest: []const []const u8) !void {
     check.pass("hy4 engine: chunks of 40 and 20, then 5 decode rows: worst rel err {e:.3} against the one step, {d} argmax flips", .{ worst, flips });
     try check.expect(worst < 1e-2 and flips == 0, "hy4 engine: chunked and decode rows differ: rel err {e}, {d} flips", .{ worst, flips });
 }
+
+/// hy4-generate CKPT IDS N: the prompt's token ids (IDS: a file of comma-separated ids) through the whole model,
+/// then N greedy tokens; rank 0 prints the ids and the decode speed (every rank decodes the same tokens).
+pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
+    if (rest.len != 3) return error.UnknownCommand;
+    const gpa = gpu.gpa;
+    var heads: std.ArrayList([hy4.engram.heads]u32) = .empty;
+    defer heads.deinit(gpa);
+    const cfg = try readConfig(gpu, rest[0], &heads);
+    const text = try std.Io.Dir.cwd().readFileAlloc(gpu.io, rest[1], gpa, .limited(1 << 20));
+    defer gpa.free(text);
+    var ids: std.ArrayList(i32) = .empty;
+    defer ids.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, text, ", \n");
+    while (it.next()) |v| try ids.append(gpa, try std.fmt.parseInt(i32, v, 10));
+    const steps = try std.fmt.parseInt(usize, rest[2], 10);
+    var s = try cuda.Stream.init(gpu.d, true);
+    defer s.deinit();
+    const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
+    var k = try engine.Kernels.load(gpu.d, sms);
+    defer k.unload();
+    var ck = try core.checkpoint.Checkpoint.openModel(gpa, gpu.io, rest[0]);
+    defer ck.close();
+    const world = envInt("TF_TP_WORLD", 1);
+    var group: ?cuda.tp_group.Group = if (world > 1) try cuda.tp_group.Group.open(gpu.d, envInt("TF_TP_RANK", 0), world) else null;
+    defer if (group) |*g| g.close();
+    const t0 = check.now(gpu.io);
+    var m = try engine.Model.open(gpa, gpu.d, s, &k, &ck, cfg, heads.items, 8192, if (group) |*g| g else null);
+    defer m.close();
+    const t1 = check.now(gpu.io);
+    std.debug.print("  rank {d} of {d}: {d} layers in {d:.1} s\n", .{ m.rank, m.world, cfg.text.layers, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
+    const V: usize = cfg.text.vocab;
+    const row = try gpa.alloc(f32, V);
+    defer gpa.free(row);
+    try m.step(ids.items, true, row);
+    const t2 = check.now(gpu.io);
+    var out: std.ArrayList(i32) = .empty;
+    defer out.deinit(gpa);
+    for (0..steps) |_| {
+        const next: i32 = @intCast(std.mem.indexOfMax(f32, row));
+        try out.append(gpa, next);
+        if (next == @as(i32, @intCast(cfg.eos))) break;
+        try m.step(&.{next}, true, row);
+    }
+    const t3 = check.now(gpu.io);
+    if (m.rank != 0) return;
+    std.debug.print("  prompt {d} tokens in {d:.2} s; {d} tokens in {d:.2} s: {d:.2} tok/s\nIDS ", .{ ids.items.len, @as(f64, @floatFromInt(t2 - t1)) / 1e9, out.items.len, @as(f64, @floatFromInt(t3 - t2)) / 1e9, @as(f64, @floatFromInt(out.items.len)) / (@as(f64, @floatFromInt(t3 - t2)) / 1e9) });
+    for (out.items) |v| std.debug.print("{d},", .{v});
+    std.debug.print("\n", .{});
+}

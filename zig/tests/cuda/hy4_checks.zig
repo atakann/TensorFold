@@ -442,6 +442,7 @@ fn attnCheck(c: *Ctx, ref: *core.checkpoint.Checkpoint) !void {
 pub fn run(gpu: check.Gpu, cmd: []const u8, rest: []const []const u8) !void {
     if (std.mem.eql(u8, cmd, "hy4-real-check")) return @import("hy4_real_check.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "hy4-engine-check")) return @import("hy4_engine_check.zig").run(gpu, rest);
+    if (std.mem.eql(u8, cmd, "hy4-generate")) return @import("hy4_engine_check.zig").generate(gpu, rest);
     const attn = std.mem.eql(u8, cmd, "hy4-attn-check");
     if (!(attn or std.mem.eql(u8, cmd, "hy4-forward-check")) or rest.len != 2) {
         std.debug.print("usage: hy4-attn-check TINY ATTN | hy4-forward-check TINY FWD   a tiny Hy4-flash against the reference\n", .{});

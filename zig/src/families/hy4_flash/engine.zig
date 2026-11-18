@@ -194,6 +194,7 @@ pub const Model = struct {
             try m.weights.append(gpa, b);
             try b.fill8(0, null);
             m.cache[i] = b.ptr;
+            ck.release(); // the layer's file pages are on the device now: give them back
             std.log.info("hy4: layer {d} of {d} on the GPU", .{ i + 1, c.layers });
         }
         return m;
