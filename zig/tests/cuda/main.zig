@@ -563,7 +563,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     }
     if (std.mem.eql(u8, cmd, "glm-loader-gate")) return glm_loader_gate.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-fp8g-shares")) return glm_fp8g_shares.run(gpu);
-    inline for (.{ .{ "dory-", @import("dory_serve_tests.zig") }, .{ "hy4-", @import("hy4_attn_check.zig") } }) |e| if (std.mem.startsWith(u8, cmd, e[0])) return e[1].run(gpu, cmd, rest);
+    inline for (.{ .{ "dory-", @import("dory_serve_tests.zig") }, .{ "hy4-", @import("hy4_checks.zig") } }) |e| if (std.mem.startsWith(u8, cmd, e[0])) return e[1].run(gpu, cmd, rest);
     if (std.mem.eql(u8, cmd, "gemma4-states")) return @import("gemma4_states_tests.zig").states(gpu, rest);
     if (std.mem.eql(u8, cmd, "spark25-pages")) return @import("spark25_pages_tests.zig").pages(gpu, rest);
     if (std.mem.eql(u8, cmd, "gemma4-pages")) return @import("gemma4_pages_tests.zig").pages(gpu, rest);

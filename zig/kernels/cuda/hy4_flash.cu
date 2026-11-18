@@ -231,3 +231,74 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_gate(__nv_bfloat16* o, 
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) o[i] = __float2bfloat16_rn(__bfloat162float(o[i]) / (1.0f + __expf(-g[i])));
 }
+
+// tf_hy4_rmsnorm on bf16 rows: out = w bf16(x rsqrt(mean(x^2) + eps)), the reference's RMSNorm on a bf16 input.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_rmsnorm16(const __nv_bfloat16* x, int64_t xs,
+                                                                  const __nv_bfloat16* w, __nv_bfloat16* out,
+                                                                  int64_t os, int64_t n, float eps) {
+  __shared__ float red[8];
+  const __nv_bfloat16* xr = x + blockIdx.x * xs;
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) ss += __bfloat162float(xr[i]) * __bfloat162float(xr[i]);
+  const float inv = rsqrtf(hy4_engram::block_sum(ss, red) / n + eps);
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+    const float v = __bfloat162float(__float2bfloat16_rn(__bfloat162float(xr[i]) * inv));
+    out[blockIdx.x * os + i] = __float2bfloat16_rn(v * __bfloat162float(w[i]));
+  }
+}
+
+// A row a block: out[r][i] += bias[i] (bf16), n values os apart a row.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_bias(float* out, int64_t os, const __nv_bfloat16* bias,
+                                                             int64_t n) {
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) out[blockIdx.x * os + i] += __bfloat162float(bias[i]);
+}
+
+// x = bf16(x + f) over n values, x bf16 and f fp32 (Engram's residual into the streams).
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_add16(__nv_bfloat16* x, const float* f, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + f[i]);
+}
+
+// a += b over n fp32 values.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_add32(float* a, const float* b, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] += b[i];
+}
+
+// A row a block: out = bf16(silu(g) u), gate g then up u in gu's 2I columns, clamped at limit (0: none).
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_swiglu(const float* gu, __nv_bfloat16* out, int64_t I,
+                                                               float limit) {
+  const float* r = gu + blockIdx.x * 2 * I;
+  for (int64_t i = threadIdx.x; i < I; i += blockDim.x) {
+    float g = __bfloat162float(__float2bfloat16_rn(r[i])), u = __bfloat162float(__float2bfloat16_rn(r[I + i]));
+    if (limit > 0.0f) {
+      g = fminf(g, limit);
+      u = fminf(fmaxf(u, -limit), limit);
+    }
+    const float a = __bfloat162float(__float2bfloat16_rn(g / (1.0f + __expf(-g))));
+    out[blockIdx.x * I + i] = __float2bfloat16_rn(a * u);
+  }
+}
+
+// A thread a row: sigmoid scores, the top k of score + bias, weights = scores normalized times scale.
+extern "C" __global__ void tf_hy4_route(const float* logits, const float* bias, int* ids, float* wts, int64_t rows,
+                                        int E, int K, float scale) {
+  const int64_t r = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  const float* l = logits + r * E;
+  float sum = 0.0f;
+  for (int k = 0; k < K; ++k) {
+    int best = -1;
+    float bv = -INFINITY;
+    for (int e = 0; e < E; ++e) {
+      bool taken = false;
+      for (int j = 0; j < k; ++j) taken |= ids[r * K + j] == e;
+      const float v = 1.0f / (1.0f + __expf(-l[e])) + bias[e];
+      if (!taken && v > bv) bv = v, best = e;
+    }
+    ids[r * K + k] = best;
+    wts[r * K + k] = 1.0f / (1.0f + __expf(-l[best]));
+    sum += wts[r * K + k];
+  }
+  for (int k = 0; k < K; ++k) wts[r * K + k] = wts[r * K + k] / (sum + 1e-20f) * scale;
+}
