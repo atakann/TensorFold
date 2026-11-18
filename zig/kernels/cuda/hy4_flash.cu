@@ -207,3 +207,27 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_engram_mix(const float*
 }
 
 }  // namespace hy4_engram
+
+// A row a block: out = bf16(x rsqrt(mean(x^2) + eps) w), x fp32 (a dense_rows output) xs apart, out os apart.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_rmsnorm(const float* x, int64_t xs, const __nv_bfloat16* w,
+                                                                __nv_bfloat16* out, int64_t os, int64_t n, float eps) {
+  __shared__ float red[8];
+  const float* xr = x + blockIdx.x * xs;
+  float ss = 0.0f;
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+  const float inv = rsqrtf(hy4_engram::block_sum(ss, red) / n + eps);
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x)
+    out[blockIdx.x * os + i] = __float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(xr[i] * inv)) * __bfloat162float(w[i]));
+}
+
+// A row a block: out = bf16(x), n values xs and os apart a row.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_cast(const float* x, int64_t xs, __nv_bfloat16* out,
+                                                             int64_t os, int64_t n) {
+  for (int64_t i = threadIdx.x; i < n; i += blockDim.x) out[blockIdx.x * os + i] = __float2bfloat16_rn(x[blockIdx.x * xs + i]);
+}
+
+// The elementwise output gate: o *= sigmoid(g), g fp32 laid out as o.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_gate(__nv_bfloat16* o, const float* g, int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) o[i] = __float2bfloat16_rn(__bfloat162float(o[i]) / (1.0f + __expf(-g[i])));
+}
