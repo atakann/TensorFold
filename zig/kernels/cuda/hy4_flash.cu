@@ -490,3 +490,21 @@ extern "C" __global__ void __launch_bounds__(512) tf_hy4_idx_tokens(const int64_
     if (g >= 0 && g * RATIO + o <= p) tok[r * 2048 + at++] = (int)(g * RATIO + o);
   if (threadIdx.x == 511) cnt[r] = at;
 }
+
+// A DFly block row a block: the kept target row's recalled keys before pos[0], then the block's rows up to this one.
+extern "C" __global__ void __launch_bounds__(256) tf_hy4_dfly_tokens(const int* snap_tok, const int* snap_cnt,
+                                                                    const int* slot, const int* pos, int* tok, int* cnt,
+                                                                    int64_t w) {
+  const int64_t r = blockIdx.x, p = pos[0], s = slot[0];
+  const int n = snap_cnt[s];
+  __shared__ int kept;
+  if (threadIdx.x == 0) kept = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const int t = snap_tok[s * 2048 + i];
+    if (t >= 0 && t < p) tok[r * w + atomicAdd(&kept, 1)] = t;
+  }
+  __syncthreads();
+  if (threadIdx.x <= r) tok[r * w + kept + threadIdx.x] = (int)(p + threadIdx.x);
+  if (threadIdx.x == 0) cnt[r] = kept + (int)r + 1;
+}

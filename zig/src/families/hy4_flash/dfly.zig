@@ -12,6 +12,9 @@ const width = drafts + 1;
 
 const Layer = struct { attn: engine.Attn, in_norm: u64, post_norm: u64, gate_up: Lin, down: Lin, inter: usize, kv: usize };
 
+/// A draft row's token list past the recall budget: the target's 2048 recalled keys and the block's rows.
+const list_width = 2048 + width;
+
 pub const Draft = struct {
     layers: []Layer,
     norm: u64,
@@ -71,6 +74,20 @@ pub const Draft = struct {
         };
     }
 
+    /// Whether the draft reads the target's recalled keys: the kept row's step ran the indexer.
+    fn overTarget(d: *const Draft, m: *const Model) bool {
+        _ = d;
+        const sn = m.snap orelse return false;
+        return m.use_index and sn.keys > m.c.index_topk;
+    }
+
+    /// The snapshot of the target layers this draft reads (a block's lists for each), on the device.
+    pub fn snap(d: *const Draft, l: engine.Loader) !engine.Snap {
+        var sn: engine.Snap = .{ .layers = undefined, .n = d.layers.len, .tok = try l.zeros(d.layers.len * engine.verify_rows * 2048 * 4), .cnt = try l.zeros(d.layers.len * engine.verify_rows * 4), .slot = try l.zeros(4) };
+        for (d.layers, 0..) |L, j| sn.layers[j] = L.kv;
+        return sn;
+    }
+
     /// Gate rows lo..lo+n then up rows lo..lo+n as one lane weight: its outputs [gate | up], as swiglu reads them.
     fn gateUp(l: engine.Loader, gate: []const u8, up: []const u8, all: usize, lo: usize, n: usize, k: usize) !Lin {
         _ = all;
@@ -105,8 +122,9 @@ pub const Draft = struct {
             }
         };
         const nch = (P + width + 511) / 512;
+        const over: usize = @intFromBool(d.overTarget(m));
         if (m.use_graphs) {
-            _ = try m.graphed(nch * engine.graph_kinds + 2, Run{ .d = d, .P = P });
+            _ = try m.graphed(nch * engine.graph_kinds + 2 + over, Run{ .d = d, .P = P });
         } else _ = try d.body(m, P);
         try m.s.synchronize();
         try cuda.memory.download(m.d, d.out, std.mem.sliceAsBytes(out));
@@ -132,10 +150,20 @@ pub const Draft = struct {
         // the layers on an fp32 residual
         const r = try m.zeros(width * hd * 4);
         try k.addb(s, r, x, width * hd);
-        for (d.layers) |*L| {
+        const over = d.overTarget(m);
+        for (d.layers, 0..) |*L, j| {
             const hn = try m.buf(width * hd * 2);
             try k.rmsNorm(s, r, hd, L.in_norm, hn, hd, width, hd, c.eps);
-            try k.addb(s, r, try m.attend(&L.attn, m.cache[L.kv], hn, d.pos, P, width), width * hd);
+            // past the recall budget: the target's recalled keys for the kept row, then the block (vLLM's reuse)
+            var list: ?Model.List = null;
+            if (over) {
+                const sn = m.snap.?;
+                const tok = try m.buf(width * list_width * 4);
+                const cnt = try m.buf(width * 4);
+                try k.dflyTokens(s, sn.tok + j * engine.verify_rows * 2048 * 4, sn.cnt + j * engine.verify_rows * 4, sn.slot, d.pos, tok, cnt, width, list_width);
+                list = .{ .tok = tok, .cnt = cnt, .w = list_width };
+            }
+            try k.addb(s, r, try m.attendList(&L.attn, m.cache[L.kv], hn, d.pos, P, width, list), width * hd);
             const hn2 = try m.buf(width * hd * 2);
             try k.rmsNorm(s, r, hd, L.post_norm, hn2, hd, width, hd, c.eps);
             const gu = try m.buf(width * 2 * L.inter * 4);

@@ -36,4 +36,15 @@ pub fn recalled(m: *Model, ix: wt.Indexer, x: u64, qr: u64, pos: u64, inv_freq: 
     try cuda.launch.launch(if (wide) m.k.select_wide else m.k.select, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = if (wide) 1024 else 128 } }, m.s, &a);
     if (m.probe != 0 and m.at_layer == m.probe_layer) try (cuda.DeviceBuffer{ .d = m.d, .ptr = m.probe, .len = n * 512 * 8, .borrowed = true }).copyFrom(0, sel, n * 512 * 8, m.s.handle);
     try k.idxTokens(m.s, sel, pos, tok, cnt, n);
+    if (m.snap) |*sn| for (sn.layers[0..sn.n], 0..) |li, j| if (li == m.at_layer) try snapshot(m, sn, j, tok, cnt, n);
+}
+
+/// Draft layer j's target lists into the snapshot: a block's rows into slots 0.., a prompt's last row into slot 0.
+fn snapshot(m: *Model, sn: *engine.Snap, j: usize, tok: u64, cnt: u64, n: usize) !void {
+    const first = if (n <= engine.verify_rows) 0 else n - 1;
+    const take = if (n <= engine.verify_rows) n else 1;
+    const dt: cuda.DeviceBuffer = .{ .d = m.d, .ptr = sn.tok + j * engine.verify_rows * 2048 * 4, .len = take * 2048 * 4, .borrowed = true };
+    try dt.copyFrom(0, tok + first * 2048 * 4, take * 2048 * 4, m.s.handle);
+    const dc: cuda.DeviceBuffer = .{ .d = m.d, .ptr = sn.cnt + j * engine.verify_rows * 4, .len = take * 4, .borrowed = true };
+    try dc.copyFrom(0, cnt + first * 4, take * 4, m.s.handle);
 }

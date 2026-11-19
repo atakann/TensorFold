@@ -45,6 +45,7 @@ pub const Kernels = struct {
     idx_pool: Function,
     idx_scores: Function,
     idx_tokens: Function,
+    dfly_tokens: Function,
     swiglu_fn: Function,
     route_fn: Function,
     hc_pre: Function,
@@ -79,6 +80,7 @@ pub const Kernels = struct {
             .idx_pool = try mod.function("tf_hy4_idx_pool"),
             .idx_scores = try mod.function("tf_hy4_idx_scores"),
             .idx_tokens = try mod.function("tf_hy4_idx_tokens"),
+            .dfly_tokens = try mod.function("tf_hy4_dfly_tokens"),
             .swiglu_fn = try mod.function("tf_hy4_swiglu"),
             .route_fn = try mod.function("tf_hy4_route"),
             .hc_pre = try mod.function("tf_hy4_hc_pre"),
@@ -225,6 +227,13 @@ pub const Kernels = struct {
         var a: Args = .{};
         inline for (.{ sel, pos, tok, cnt }) |v| a.add(v);
         try cuda.launch.launch(k.idx_tokens, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 512 } }, s, &a);
+    }
+
+    /// DFly's token lists [rows][w]: snapshot slot slot[0]'s keys before pos[0], then the block's rows causally.
+    pub fn dflyTokens(k: *const Kernels, s: Stream, snap_tok: u64, snap_cnt: u64, slot: u64, pos: u64, tok: u64, cnt: u64, rows: usize, w: usize) !void {
+        var a: Args = .{};
+        inline for (.{ snap_tok, snap_cnt, slot, pos, tok, cnt, i64of(w) }) |v| a.add(v);
+        try cuda.launch.launch(k.dfly_tokens, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// a fp32 += b bf16 over n values.

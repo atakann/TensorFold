@@ -214,6 +214,7 @@ pub fn generate(gpu: check.Gpu, rest: []const []const u8) !void {
         const n_kv = try dflyConfig(gpu, rest[0], &kv, &mask);
         const l: engine.Loader = .{ .gpa = gpa, .d = gpu.d, .ck = &ck, .bufs = &m.weights, .rank = m.rank, .world = m.world, .s = s, .packer = &k.packer, .context = m.context };
         draft = try hy4.dfly.Draft.load(l, gpa, kv[0..n_kv], mask, cfg.text.q_rank, cfg.text.hidden);
+        if (std.c.getenv("TF_HY4_DFLY_DENSE") == null) m.snap = try draft.?.snap(l);
     }
     var tok: [D + 1]i32 = undefined;
     try m.step(ids.items, true, &tok, null);

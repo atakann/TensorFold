@@ -75,8 +75,11 @@ const Engram = wt.Engram;
 const loadLayer = wt.loadLayer;
 const bf16of = wt.bf16of;
 
-/// Graphs a chunk count holds: a decode row, a verify block, a DFly proposal.
-pub const graph_kinds = 3;
+/// The snapshot DFly reads: target layers, their token lists [layers][6][2048] and counts, the kept slot, validity.
+pub const Snap = struct { layers: [8]usize, n: usize, tok: u64, cnt: u64, slot: u64, keys: usize = 0, kept: usize = 0 };
+
+/// Graphs a chunk count holds: a decode row, a verify block, a DFly proposal (dense, or over the target's keys).
+pub const graph_kinds = 4;
 /// A captured step and where it leaves its result (logits, or DFly's draft ids) and its final-normed rows.
 pub const Graph = struct { exec: cuda.graph.Exec, logits: u64, hn: u64, local: u64 };
 
@@ -123,6 +126,8 @@ pub const Model = struct {
     use_graphs: bool = true,
     /// false: sparse layers attend densely past the recall budget too (checks the indexer against it).
     use_index: bool = true,
+    /// DFly's view of the target's indexer: the last step's recalled lists for its draft layers' target layers.
+    snap: ?Snap = null,
     /// A check's copy of one layer's recalled groups ([rows][512] int64 at `probe`; 0: none).
     probe: u64 = 0,
     probe_layer: usize = 0,
@@ -263,6 +268,7 @@ pub const Model = struct {
         const rows = if (last) 1 else n;
         const kind: ?usize = if (n == 1 and last) 0 else if (n == verify_rows and !last) 1 else null;
         const toks = if (kind != null and m.use_graphs and m.prof == null and logits == null) try m.replay(kind.?, p0, n, last) else try m.compute(n, p0, last);
+        if (m.snap) |*sn| sn.keys = p0 + n; // the step keepRow names next: its lists stand when it ran the indexer
         try m.s.synchronize();
         try cuda.memory.download(m.d, toks, std.mem.sliceAsBytes(out[0..rows]));
         if (logits) |full| try m.gatherLogits(rows, full);
@@ -299,6 +305,11 @@ pub const Model = struct {
     /// Row `r` of the last step's final-normed rows into `anchor` (the step's buffers are still in place).
     pub fn keepRow(m: *Model, r: usize) !void {
         const hd: usize = m.c.hidden;
+        if (m.snap) |*sn| {
+            sn.kept = r;
+            const h = [1]i32{@intCast(r)};
+            try (cuda.DeviceBuffer{ .d = m.d, .ptr = sn.slot, .len = 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(&h));
+        }
         try (cuda.DeviceBuffer{ .d = m.d, .ptr = m.anchor, .len = hd * 2, .borrowed = true }).copyFrom(0, m.hn + r * hd * 2, hd * 2, m.s.handle);
     }
 
@@ -426,6 +437,12 @@ pub const Model = struct {
 
     /// Rows p0..: latent rows into `cache`, then MLA over it (sliding: the last `window` keys a row as a token list).
     pub fn attend(m: *Model, a: *const Attn, cache: u64, x: u64, pos: u64, p0: usize, n: usize) !u64 {
+        return m.attendList(a, cache, x, pos, p0, n, null);
+    }
+
+    /// A token list each row reads in place of the layer's own choice (DFly over the target's recalled keys).
+    pub const List = struct { tok: u64, cnt: u64, w: usize };
+    pub fn attendList(m: *Model, a: *const Attn, cache: u64, x: u64, pos: u64, p0: usize, n: usize, list: ?List) !u64 {
         const c = m.c;
         const hd: usize = c.hidden;
         const H = a.heads;
@@ -456,10 +473,12 @@ pub const Model = struct {
         const recall: usize = c.index_topk; // the indexer runs once the keys outgrow it
         if (a.idx) |ix| try index.keys(m, ix, x, pos, a.inv_freq, n);
         const indexed = a.idx != null and keys > recall and m.use_index;
-        const nch: usize = if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
+        const nch: usize = if (list) |li| (li.w + 511) / 512 else if (a.sliding) (win + 511) / 512 else if (indexed) recall / 512 else (keys + 511) / 512;
         const part: cuda.mla.Partials = .{ .po = try m.zeros(nch * n * H * 512 * 4), .pm = try m.zeros(nch * n * H * 4), .pl = try m.zeros(nch * n * H * 4) };
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.sparse.nope + c.sparse.rope)));
-        if (a.sliding) {
+        if (list) |li| {
+            try hy4.sparseChunks(&m.k.mla, m.s, qa, cache, li.tok, li.cnt, li.w, part, n, H, scale);
+        } else if (a.sliding) {
             const tok = try m.buf(n * win * 4);
             const cnt = try m.buf(n * 4);
             try k.window(m.s, pos, tok, cnt, n, win);
