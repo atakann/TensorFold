@@ -186,8 +186,8 @@ pub const Hy4 = struct {
         return .{ .exact_width = max_window, .copy_drafts = false, .gpu_tokens = false, .mtp = head, .speculate = head, .speculate_early = false, .drafts = dfly.drafts, .draft_prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7 }, .window_costs = &costs, .mtp_step_ms = 0, .max_streams = 1 };
     }
 
-    /// DFly drafts 5 at once and verify runs 6 rows whatever the width: every drafted width costs the same.
-    const costs = [_]lanes.config.Cost{ .{ .width = 1, .ms = 56 }, .{ .width = 2, .ms = 66 }, .{ .width = 3, .ms = 66 }, .{ .width = 4, .ms = 66 }, .{ .width = 5, .ms = 66 }, .{ .width = 6, .ms = 66 } };
+    /// A drafted round (DFly's 5 drafts, then the 6-row verify) takes ~88 ms on two Sparks whatever its width.
+    const costs = [_]lanes.config.Cost{ .{ .width = 1, .ms = 56 }, .{ .width = 2, .ms = 88 }, .{ .width = 3, .ms = 88 }, .{ .width = 4, .ms = 88 }, .{ .width = 5, .ms = 88 }, .{ .width = 6, .ms = 88 } };
 
     fn self(ptr: *anyopaque) *Hy4 {
         return @ptrCast(@alignCast(ptr));
@@ -301,9 +301,9 @@ pub const Hy4 = struct {
             if (x.calls.draft == null) return error.NoDraftHead;
             if (r.lanes != null or r.depth > dfly.drafts) return error.ChainsOnly;
             const t: u32 = if (r.follow.len > 0) r.follow[r.follow.len - 1] else if (r.first) |f| try x.value(f) else return error.NoPendingToken;
-            // a draft may come before the verify's keep: the cache and DFly's anchor at the request's kept row
+            // the cache and DFly's anchor at the request's kept row (a window kept whole gets no keep call)
             const len = r.position - 1;
-            if (r.rows != null and x.calls.m.tokens.items.len != len) try x.calls.keep(len, @intCast(len - r.start - 1));
+            if (r.rows != null) try x.calls.keep(len, @intCast(len - r.start - 1));
             try x.calls.propose(@intCast(t), &x.held);
         }
     }
