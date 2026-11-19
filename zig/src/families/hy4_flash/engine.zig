@@ -13,7 +13,7 @@ const Bufs = std.ArrayList(cuda.DeviceBuffer);
 /// A latent cache row: the 512 normed latent values, then the 64 roped ones (bf16).
 pub const row_width = 576;
 /// The rows a step takes at most when only its last row's token is wanted (longer prompts go in chunks).
-pub const max_step_rows = 1024;
+pub const max_step_rows = 2048;
 /// A verify block's rows: the last token and DFly's drafts.
 pub const verify_rows = 6;
 const hc_eps: f32 = 1e-6;
