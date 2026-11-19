@@ -586,14 +586,9 @@ pub const Model = struct {
         const rows = try m.buf(n * engram.heads * 96 * 2);
         try m.k.k.engramRows(m.s, e.hash, e.offsets, e.table, e.row_norm, eps_engram, rows, n);
         const ew = engram.heads * 96;
-        const value = try m.zeros(n * hd * 4);
-        try m.k.dense.rows(m.s, rows, ew, e.value, value, hd, n, hd, ew);
-        try m.k.k.bias(m.s, value, hd, e.value_bias, n, hd);
-        const key = try m.zeros(n * S * hd * 4);
-        for (0..S) |s| {
-            try m.k.dense.rows(m.s, rows, ew, e.key[s], key + s * hd * 4, S * hd, n, hd, ew);
-            try m.k.k.bias(m.s, key + s * hd * 4, S * hd, e.key_bias[s], n, hd);
-        }
-        try m.k.k.engramMix(m.s, key, value, m.x, e.mix, eps_engram, res, n, hd);
+        const kv = try m.buf(n * (S + 1) * hd * 4); // each row [k0 k1 k2 k3 v] fp32, on the tensor cores
+        try m.proj(e.proj, rows, ew, kv, n);
+        try m.k.k.bias(m.s, kv, (S + 1) * hd, e.bias, n, (S + 1) * hd);
+        try m.k.k.engramMix(m.s, kv, kv + S * hd * 4, m.x, e.mix, eps_engram, res, n, hd);
     }
 };

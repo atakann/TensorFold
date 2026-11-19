@@ -180,12 +180,12 @@ extern "C" __global__ void __launch_bounds__(256) tf_hy4_engram_mix(const float*
                                                       const float* hc_scale, float eps, float* out, int64_t D) {
   __shared__ float red[8];
   const int64_t r = blockIdx.x;
-  const float* vr = value + r * D;
+  const float* vr = value + r * (S + 1) * D;
   float ss = 0.0f;
   for (int64_t d = threadIdx.x; d < D; d += blockDim.x) ss += vr[d] * vr[d];
   const float vinv = rsqrtf(block_sum(ss, red) / D + eps);
   for (int k = 0; k < S; ++k) {
-    const float* kr = key + (r * S + k) * D;
+    const float* kr = key + r * (S + 1) * D + k * D;
     const __nv_bfloat16* xr = x + (r * S + k) * D;
     float kk = 0.0f, qq = 0.0f;
     for (int64_t d = threadIdx.x; d < D; d += blockDim.x) {

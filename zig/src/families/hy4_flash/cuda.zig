@@ -288,7 +288,7 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.engram_rows, .{ .grid = .{ .x = @intCast(rows), .y = 16 }, .block = .{ .x = 96 } }, s, &a);
     }
 
-    /// Engram's gated residual out [rows][4][d] fp32 from key [rows][4][d], value [rows][d] and the streams.
+    /// Engram's gated residual out [rows][4][d] fp32 from joined rows [rows][5][d] (keys 0..3, value) and the streams.
     pub fn engramMix(k: *const Kernels, s: Stream, key: u64, value: u64, x: u64, w: EngramMix, eps: f32, out: u64, rows: usize, d: usize) !void {
         var a: Args = .{};
         inline for (.{ key, value, x, w.norm_key, w.norm_query, w.gamma, w.hc_scale, eps, out, i64of(d) }) |v| a.add(v);

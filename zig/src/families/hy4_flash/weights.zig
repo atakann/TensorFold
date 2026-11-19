@@ -19,7 +19,8 @@ pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_nor
 pub const Indexer = struct { q: Lin, hw: Lin, tk: Lin, tk_norm: u64, wv: u64, wg: u64, ape: u64, k_norm: u64, tk_cache: u64, gk_cache: u64 };
 pub const Moe = struct { router: Lin, bias: u64, down: Lin, up: Lin, routed: cuda.experts.Layer, shared: cuda.experts.Layer, norm: u64 };
 pub const Mlp = union(enum) { dense: struct { t: cuda.experts.Layer, norm: u64 }, moe: Moe };
-pub const Engram = struct { ids: []align(1) const i32, hash: u64, offsets: u64, moduli: [engram.heads]u32, mult: [engram.max_ngram]u64, table: hy4.EngramTable, row_norm: u64, value: u64, value_bias: u64, key: [4]u64, key_bias: [4]u64, mix: hy4.EngramMix };
+/// proj: the four key projections and the value projection as one weight, rows [k0 k1 k2 k3 v]; bias likewise.
+pub const Engram = struct { ids: []align(1) const i32, hash: u64, offsets: u64, moduli: [engram.heads]u32, mult: [engram.max_ngram]u64, table: hy4.EngramTable, row_norm: u64, proj: Lin, bias: u64, mix: hy4.EngramMix };
 pub const Layer = struct { attn: Attn, hc_attn: hy4.Hc, hc_ffn: hy4.Hc, in_norm: u64, post_norm: u64, mlp: Mlp, engram: ?Engram };
 
 /// Device buffers that live as long as the model, and the checkpoint they came from.
@@ -201,7 +202,7 @@ pub fn loadEngram(l: Loader, i: usize, moduli: [engram.heads]u32) !Engram {
     }
     const tw = try l.tensor(p ++ "multi_head_embedding.embedding.weight", .{i});
     const table: hy4.EngramTable = if (tw.dtype == .f8_e4m3) .{ .fp8 = try l.up(tw.bytes), .scales = try l.w(p ++ "multi_head_embedding.embedding.weight_scale_inv", .{i}) } else .{ .bf16 = try l.up(tw.bytes) };
-    var e: Engram = .{
+    const e: Engram = .{
         .ids = std.mem.bytesAsSlice(i32, (try l.tensor(p ++ "lookup_table", .{i})).bytes),
         .hash = try l.zeros(l.context * engram.heads * 4),
         .offsets = try l.up(std.mem.sliceAsBytes(&offsets)),
@@ -209,17 +210,23 @@ pub fn loadEngram(l: Loader, i: usize, moduli: [engram.heads]u32) !Engram {
         .mult = engram.multipliers(@intCast(i + 1)) orelse return error.NoEngramMultipliers,
         .table = table,
         .row_norm = try l.f32s(p ++ "lookup_per_head_norms.{d}.weight", .{i}, true, engram.heads),
-        .value = try l.w(p ++ "value_proj.weight", .{i}),
-        .value_bias = try l.w(p ++ "value_proj.bias", .{i}),
-        .key = undefined,
-        .key_bias = undefined,
+        .proj = try joined(l, p ++ "key_projs.{d}.weight", p ++ "value_proj.weight", i, true),
+        .bias = (try joined(l, p ++ "key_projs.{d}.bias", p ++ "value_proj.bias", i, false)).codes,
         .mix = .{ .norm_key = try l.f32s(p ++ "norm_key.{d}.weight", .{i}, true, 4), .norm_query = try l.f32s(p ++ "norm_query.{d}.weight", .{i}, true, 4), .gamma = try l.f32s(p ++ "unified_pre_gamma", .{i}, false, 1), .hc_scale = try l.f32s(p ++ "unified_per_hc_scales.{d}", .{i}, true, 4) },
     };
-    for (0..4) |s| {
-        e.key[s] = try l.w(p ++ "key_projs.{d}.weight", .{ i, s });
-        e.key_bias[s] = try l.w(p ++ "key_projs.{d}.bias", .{ i, s });
-    }
     return e;
+}
+
+/// The four key tensors then the value tensor, one after another: a Lane weight (`lin`), else raw bytes at `codes`.
+fn joined(l: Loader, comptime key: []const u8, comptime value: []const u8, i: usize, lin: bool) !Lin {
+    var ts: [5]Tensor = undefined;
+    for (0..4) |s| ts[s] = try l.tensor(key, .{ i, s });
+    ts[4] = try l.tensor(value, .{i});
+    var all: std.ArrayList(u8) = .empty;
+    defer all.deinit(l.gpa);
+    for (ts) |t| try all.appendSlice(l.gpa, t.bytes);
+    if (lin) return l.lin(all.items, 5 * ts[0].dim(0), ts[0].dim(1));
+    return .{ .mode = .bf16, .codes = try l.up(all.items), .scales = 0, .n = 0, .k = 0, .npad = 0 };
 }
 
 /// The compressed indexer of sparse layer `i`, with caches for `l.context` tokens.
