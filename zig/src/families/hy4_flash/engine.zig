@@ -12,6 +12,8 @@ const Bufs = std.ArrayList(cuda.DeviceBuffer);
 
 /// A latent cache row: the 512 normed latent values, then the 64 roped ones (bf16).
 pub const row_width = 576;
+/// The rows a step takes at most when only its last row's token is wanted (longer prompts go in chunks).
+pub const max_step_rows = 1024;
 /// A verify block's rows: the last token and DFly's drafts.
 pub const verify_rows = 6;
 const hc_eps: f32 = 1e-6;
@@ -245,6 +247,12 @@ pub const Model = struct {
 
     /// Rows `ids` at tokens.len..: each row's greedy token (or the `last`'s) into `out`, `logits` their full logits.
     pub fn step(m: *Model, ids: []const i32, last: bool, out: []i32, logits: ?[]f32) !void {
+        // a long prompt goes in chunks: a step's scratch stays bounded whatever the prompt's length
+        if (last and ids.len > max_step_rows) {
+            var at: usize = 0;
+            while (ids.len - at > max_step_rows) : (at += max_step_rows) try m.step(ids[at..][0..max_step_rows], true, out, null);
+            return m.step(ids[at..], true, out, logits);
+        }
         defer m.reset();
         const n = ids.len;
         const p0 = m.tokens.items.len;
@@ -377,7 +385,9 @@ pub const Model = struct {
         errdefer std.log.err("hy4 step: failed in layer {d}'s {s} ({d} rows at {d})", .{ at, stage, n, p0 });
         var t: i96 = if (m.prof) |io| std.Io.Clock.awake.now(io).toNanoseconds() else 0;
         try m.mark(3, &t);
+        const kept = m.used; // a layer's scratch is taken back at its end: a step holds one layer's at a time
         for (m.layers, 0..) |*L, i| {
+            m.used = kept;
             at = i;
             m.at_layer = i;
             stage = "engram";
