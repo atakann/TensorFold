@@ -9,6 +9,9 @@ pub const engine = @import("engine.zig");
 /// The DFly drafter on the engine's caches.
 pub const dfly = @import("dfly.zig");
 pub const config = @import("config.zig");
+pub const files = @import("files.zig");
+pub const serve = @import("serve.zig");
+pub const native = @import("native.zig");
 
 const Stream = cuda.Stream;
 const Args = cuda.launch.Args;
