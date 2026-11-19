@@ -8,6 +8,8 @@ const Allocator = std.mem.Allocator;
 
 pub const efforts = [_][]const u8{ "none", "minimal", "low", "medium", "high", "xhigh", "max" };
 const effort_order = [_][]const u8{ "max", "xhigh", "high", "medium", "low", "minimal" }; // highest first
+/// Hy4-flash's template turns thinking off by this effort (vLLM passes it through as named).
+pub const off_level = "no_think";
 
 /// Python's type name for ``'<type>' object has no attribute 'get'``.
 pub fn typeName(v: Value) []const u8 {
@@ -214,9 +216,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
-        out.effort = coerceEffort(e.string, levels);
-        out.enable = !std.mem.eql(u8, e.string, "none");
+        const name = if (e == .string and std.mem.eql(u8, e.string, off_level)) "none" else if (e == .string) e.string else "";
+        if (!isEffort(name)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+        out.effort = coerceEffort(name, levels);
+        out.enable = !std.mem.eql(u8, name, "none");
     }
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();
@@ -275,7 +278,7 @@ pub fn coerceEffort(effort: []const u8, levels: []const []const u8) []const u8 {
 /// The efforts a chat template names in quotes (``effort_levels``).
 pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const []const u8 {
     var found: std.ArrayList([]const u8) = .empty;
-    for (effort_order) |name| {
+    for (effort_order ++ [_][]const u8{off_level}) |name| {
         var at: usize = 0;
         while (std.mem.indexOfPos(u8, template, at, name)) |i| : (at = i + 1) {
             if (i == 0 or i + name.len >= template.len) continue;
@@ -288,6 +291,12 @@ pub fn effortLevels(a: Allocator, template: []const u8) Allocator.Error![]const 
         }
     }
     return found.items;
+}
+
+/// The template's own effort for thinking off (Hy4-flash's `no_think`), when it names one.
+pub fn offLevel(levels: []const []const u8) ?[]const u8 {
+    for (levels) |l| if (std.mem.eql(u8, l, off_level)) return off_level;
+    return null;
 }
 
 /// ``probability_options``: n must be 1; the ``top_logprobs`` count when logprobs are asked and ``supported``.

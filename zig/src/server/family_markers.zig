@@ -1,0 +1,24 @@
+//! The think markers a family's tokenizer names: Hy4-flash's `</think:opensource>` beside the shared ones.
+const reply_text = @import("reply_text.zig");
+
+/// Hy4-flash's template opens the think block in the prompt; the reply closes it with its own tag.
+pub const hy4: reply_text.Markers = .{ .open = "", .close = "</think:opensource>" };
+
+/// The server's markers: MiniMax-M3's or Hy4-flash's when the tokenizer has their closer, else `current`.
+pub fn pick(current: reply_text.Markers, minimax: bool, text: anytype) reply_text.Markers {
+    if (minimax) return reply_text.mm_markers;
+    if (text.tokenId(hy4.close) != null) return hy4;
+    return current;
+}
+
+/// The tag a reply's think block ends with: the markers' own, `</think>` beside Gemma 4's channel.
+pub fn closeTag(m: reply_text.Markers) []const u8 {
+    return if (reply_text.isChannel(m)) "</think>" else m.close;
+}
+
+test "Hy4-flash's closer is its own, the shared markers keep theirs" {
+    const std = @import("std");
+    try std.testing.expectEqualStrings("</think:opensource>", closeTag(hy4));
+    try std.testing.expectEqualStrings("</think>", closeTag(reply_text.channel_markers));
+    try std.testing.expectEqualStrings("</mm:think>", closeTag(reply_text.mm_markers));
+}

@@ -46,7 +46,8 @@ pub fn renderStarts(srv: *Server, cx: *Cx, messages: Value, tools: []const Value
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
         .add_generation_prompt = generation,
         .enable_thinking = thinking,
-        .reasoning_effort = if (thinking) effort else cx.named_effort, // off: only an effort the request named
+        // off: only an effort the request named, else the template's own off level (Hy4-flash's no_think)
+        .reasoning_effort = if (thinking) effort else cx.named_effort orelse @import("fields.zig").offLevel(srv.effort_levels),
         .clear_thinking = cx.clear_thinking,
         .tool_choice = cx.template_fields.get("tool_choice"),
         .response_format = cx.template_fields.get("response_format"),
