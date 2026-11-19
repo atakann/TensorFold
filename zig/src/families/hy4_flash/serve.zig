@@ -180,11 +180,14 @@ pub const Hy4 = struct {
 
     const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release };
 
-    /// The round loop's facts: one stream; DFly holds 5 drafts a round when loaded.
+    /// The round loop's facts: one stream; DFly holds 5 drafts a round when loaded (two Sparks' measured ms).
     pub fn facts(x: *const Hy4) lanes.Model {
         const head = x.calls.draft != null;
-        return .{ .exact_width = 1, .gpu_tokens = false, .mtp = head, .speculate = false, .speculate_early = false, .drafts = if (head) dfly.drafts else 1, .draft_prior = if (head) &.{ 0.85, 0.7, 0.55, 0.45, 0.35 } else &.{}, .max_streams = 1 };
+        return .{ .exact_width = max_window, .copy_drafts = false, .gpu_tokens = false, .mtp = head, .speculate = head, .speculate_early = false, .drafts = dfly.drafts, .draft_prior = &.{ 0.9, 0.85, 0.8, 0.75, 0.7 }, .window_costs = &costs, .mtp_step_ms = 0, .max_streams = 1 };
     }
+
+    /// DFly drafts 5 at once and verify runs 6 rows whatever the width: every drafted width costs the same.
+    const costs = [_]lanes.config.Cost{ .{ .width = 1, .ms = 56 }, .{ .width = 2, .ms = 66 }, .{ .width = 3, .ms = 66 }, .{ .width = 4, .ms = 66 }, .{ .width = 5, .ms = 66 }, .{ .width = 6, .ms = 66 } };
 
     fn self(ptr: *anyopaque) *Hy4 {
         return @ptrCast(@alignCast(ptr));
@@ -271,10 +274,13 @@ pub const Hy4 = struct {
         x.base = x.calls.m.tokens.items.len;
         x.n = w.rows();
         x.rows[0] = @intCast(w.pending);
-        if (w.held > 0) @memcpy(x.rows[1..x.n], x.held[0..w.held]);
+        // held drafts: every one of DFly's 5 runs, so the round replays the 6-row graph (keep drops the extra rows)
+        const run = if (w.held > 0) max_window else x.n;
+        if (w.held > 0) @memcpy(x.rows[1..run], &x.held);
         for (w.tokens, 1..) |t, r| x.rows[r] = @intCast(t);
         for (w.positions, 0..) |pos, r| if (pos != x.base + r + 1) return error.PositionMismatch;
-        try x.calls.step(x.rows[0..x.n], false, &x.out, x.logitsFor(x.n), null);
+        try x.calls.step(x.rows[0..run], false, &x.out, x.logitsFor(run), null);
+        if (run > x.n) try x.calls.keep(x.base + x.n, @intCast(x.n - 1)); // a window kept whole skips keep
         for (0..x.n) |r| out[0].sampled[r] = try x.draw(r, w.positions[r]);
         for (x.rows[1..x.n], 0..) |t, r| out[0].drafts[r] = @intCast(t);
     }
@@ -295,6 +301,9 @@ pub const Hy4 = struct {
             if (x.calls.draft == null) return error.NoDraftHead;
             if (r.lanes != null or r.depth > dfly.drafts) return error.ChainsOnly;
             const t: u32 = if (r.follow.len > 0) r.follow[r.follow.len - 1] else if (r.first) |f| try x.value(f) else return error.NoPendingToken;
+            // a draft may come before the verify's keep: the cache and DFly's anchor at the request's kept row
+            const len = r.position - 1;
+            if (r.rows != null and x.calls.m.tokens.items.len != len) try x.calls.keep(len, @intCast(len - r.start - 1));
             try x.calls.propose(@intCast(t), &x.held);
         }
     }
