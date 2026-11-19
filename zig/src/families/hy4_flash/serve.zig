@@ -227,10 +227,13 @@ pub const Hy4 = struct {
         x.sampling = if (s.sampling) |sm| (if (sm.temperature > 0) sm else null) else null;
         x.prompt.clearRetainingCapacity();
         for (p) |t| try x.prompt.append(x.gpa, @intCast(t));
-        try x.calls.clear();
-        try x.calls.step(x.prompt.items, true, &x.out, x.logitsFor(1), 0);
+        // the last request's caches stand for the tokens it fed: a prompt that starts with them prefills only the rest
+        const fed = m.tokens.items;
+        const same = @min(std.mem.indexOfDiff(i32, fed, x.prompt.items) orelse fed.len, x.prompt.items.len - 1);
+        if (same == 0) try x.calls.clear() else try x.calls.keep(same, 0);
+        try x.calls.step(x.prompt.items[same..], true, &x.out, x.logitsFor(1), 0);
         x.stream = s;
-        s.cached = 0;
+        s.cached = @intCast(same);
         s.fill_at.store(@intCast(p.len), .monotonic);
     }
 
