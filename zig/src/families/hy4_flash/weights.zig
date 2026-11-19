@@ -14,7 +14,10 @@ const sliding_theta: f64 = 1e4;
 
 /// A bf16 projection in the lane matmul's layout (rows padded to 128).
 pub const Lin = cuda.qmmf.Weight;
-pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool, idx: ?Indexer = null };
+/// Per head on the tensor cores for prompt passes: wk transposed [512][192] (absorb), wv [256][512] (expand).
+pub const max_heads = 64;
+pub const HeadLins = struct { wk: [max_heads]Lin = undefined, wv: [max_heads]Lin = undefined };
+pub const Attn = struct { q_a: Lin, q_a_norm: u64, q_b: Lin, kv_a: Lin, kv_a_norm: u64, wk: u64, wv: u64, lins: HeadLins, sink: u64, gate: Lin, o: Lin, post_norm: u64, inv_freq: u64, heads: usize, sliding: bool, idx: ?Indexer = null };
 /// A sparse layer's compressed indexer (replicated on every rank) and its caches: token keys, pooled group keys.
 pub const Indexer = struct { q: Lin, hw: Lin, tk: Lin, tk_norm: u64, wv: u64, wg: u64, ape: u64, k_norm: u64, tk_cache: u64, gk_cache: u64 };
 pub const Moe = struct { router: Lin, bias: u64, down: Lin, up: Lin, routed: cuda.experts.Layer, shared: cuda.experts.Layer, norm: u64 };
@@ -158,6 +161,18 @@ pub fn loadAttn(l: Loader, comptime a: []const u8, args: anytype, H_all: usize, 
         @memcpy(wk[h * 192 * 1024 ..][0 .. 192 * 1024], kvb[(h0 + h) * 448 * 1024 ..][0 .. 192 * 1024]);
         @memcpy(wv[h * 256 * 1024 ..][0 .. 256 * 1024], kvb[((h0 + h) * 448 + 192) * 1024 ..][0 .. 256 * 1024]);
     }
+    if (H > max_heads) return error.TooManyHeads;
+    var lins: HeadLins = .{};
+    const wkt = try l.gpa.alloc(u16, 512 * 192);
+    defer l.gpa.free(wkt);
+    for (0..H) |h| {
+        const src = std.mem.bytesAsSlice(u16, wk[h * 192 * 1024 ..][0 .. 192 * 1024]);
+        for (0..192) |k| for (0..512) |c| {
+            wkt[c * 192 + k] = src[k * 512 + c];
+        };
+        lins.wk[h] = try l.lin(std.mem.sliceAsBytes(wkt), 512, 192);
+        lins.wv[h] = try l.lin(wv[h * 256 * 1024 ..][0 .. 256 * 1024], 256, 512);
+    }
     const rows = H * 256 * 2; // a head slice's bytes a hidden column of q_b's and the gate's outputs
     const o_all = (try l.tensor(a ++ "o_proj.weight", args)).bytes;
     const o = try l.gpa.alloc(u8, hd * rows);
@@ -166,7 +181,7 @@ pub fn loadAttn(l: Loader, comptime a: []const u8, args: anytype, H_all: usize, 
     const st = try l.tensor(a ++ "learnable_sink_param", args); // fp32 in the target, bf16 in DFly
     var sink: [128]f32 = undefined;
     for (0..H) |h| sink[h] = if (st.dtype == .f32) std.mem.bytesAsValue(f32, st.bytes[(h0 + h) * 4 ..][0..4]).* else @bitCast(@as(u32, std.mem.readInt(u16, st.bytes[(h0 + h) * 2 ..][0..2], .little)) << 16);
-    return .{ .q_a = try l.linOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.lin((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.lin((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.lin(o, hd, H * 256), .post_norm = try l.w(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
+    return .{ .q_a = try l.linOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.lin((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .lins = lins, .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.lin((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.lin(o, hd, H * 256), .post_norm = try l.w(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
 }
 
 pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, engram_here: bool) !Layer {

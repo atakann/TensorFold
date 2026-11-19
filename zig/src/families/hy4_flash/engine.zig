@@ -65,6 +65,7 @@ pub const Kernels = struct {
 
 const wt = @import("weights.zig");
 const index = @import("index.zig");
+const per_head = @import("heads.zig");
 pub const Lin = wt.Lin;
 pub const Attn = wt.Attn;
 pub const Loader = wt.Loader;
@@ -466,7 +467,7 @@ pub const Model = struct {
         try k.castRows(m.s, kv_f + 512 * 4, row_width, rows + 512 * 2, row_width, n, 64);
         try m.k.mla.rope(m.s, .{ .x = rows + 512 * 2, .x_row = row_width, .x_head = 0, .out = rows + 512 * 2, .o_row = row_width, .o_head = 0 }, n, 1, pos, a.inv_freq, 1.0);
         try k.put(m.s, cache, rows, pos, n, row_width);
-        try k.absorbQ(m.s, q, a.wk, qa, n, H);
+        if (n >= per_head.min_rows) try per_head.absorb(m, a, q, qa, n) else try k.absorbQ(m.s, q, a.wk, qa, n, H);
         try m.mark(4, &t);
         const keys = p0 + n;
         const win: usize = c.window;
@@ -493,7 +494,7 @@ pub const Model = struct {
         const ol = try m.buf(n * H * 512 * 2);
         try k.mergeSink(m.s, part, a.sink, ol, n, H, nch);
         const o = try m.buf(n * H * 256 * 2);
-        try k.expandV(m.s, ol, a.wv, o, n, H);
+        if (n >= per_head.min_rows) try per_head.expand(m, a, ol, o, n) else try k.expandV(m.s, ol, a.wv, o, n, H);
         try m.mark(7, &t);
         const g = try m.buf(n * H * 256 * 4);
         try m.proj(a.gate, x, hd, g, n);
