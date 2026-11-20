@@ -88,6 +88,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.k.unload();
     own.group = if (world > 1) try cuda.tp_group.Group.open(ctx.d, rank, world) else null;
     errdefer if (own.group) |*g| g.close();
+    // two ranks: sums up to 4 MiB by RoCE writes, larger ones by NCCL (TF_ROCE=0: NCCL for all), as GLM's gathers
+    if (own.group) |*g| if (world == 2) try g.openRoce(gpa, io, ctx.d, own.s, 4 << 20);
     const group: ?*const cuda.tp_group.Group = if (own.group) |*g| g else null;
     // the cache holds the window, the verify reserve and DFly's block, in whole 512-key chunks
     const context = std.mem.alignForward(usize, o.context + 2 * serve.max_window, 512);

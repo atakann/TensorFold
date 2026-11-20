@@ -139,7 +139,12 @@ pub const Model = struct {
     world: usize = 1,
 
     pub fn sum(m: *Model, p: u64, count: usize) !void {
-        if (m.group) |g| try g.allReduceSum(m.s, p, count);
+        const g = m.group orelse return;
+        const f = g.fast orelse return g.allReduceSum(m.s, p, count); // two ranks: RoCE writes (openRoce) where it fits
+        if (g.world != 2 or !f.fits(count * 4)) return g.allReduceSum(m.s, p, count);
+        const both = try m.buf(2 * count * 4);
+        try g.allGather(m.s, p, both, count * 4);
+        try m.k.k.add32(m.s, p, both + (1 - m.rank) * count * 4, count); // the other rank's partial: a + b == b + a
     }
 
     /// Every layer of `c` from `ck` onto the device; `heads` the Engram head sizes by layer id (config.json).
