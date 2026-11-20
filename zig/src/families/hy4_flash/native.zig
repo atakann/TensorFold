@@ -70,6 +70,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const rank: usize = o.rank;
     const world: usize = @max(o.tp, 1);
     if (rank >= world) return error.BadRank;
+    // TF_HY4_FP8=0 keeps the projections BF16 as stored; by default they load as FP8 E4M3 (fp8.zig)
+    @import("weights.zig").fp8_projections = if (core.profile.lookup("TF_HY4_FP8")) |v| !std.mem.eql(u8, v, "0") else true;
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;

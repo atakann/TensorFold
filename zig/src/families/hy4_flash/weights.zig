@@ -27,6 +27,9 @@ pub const Engram = struct { ids: []align(1) const i32, hash: u64, offsets: u64, 
 pub const Layer = struct { attn: Attn, hc_attn: hy4.Hc, hc_ffn: hy4.Hc, in_norm: u64, post_norm: u64, mlp: Mlp, engram: ?Engram };
 
 /// Device buffers that live as long as the model, and the checkpoint they came from.
+/// Attention and latent projections as FP8 E4M3 at load, one scale a tensor (set before the model opens).
+pub var fp8_projections = false;
+
 pub const Loader = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -57,6 +60,28 @@ pub const Loader = struct {
         try l.s.synchronize();
         try l.bufs.append(l.gpa, out);
         return cuda.modelopt.bf16Weight(out.ptr, n, k);
+    }
+
+    /// As `lin`, or with `fp8_projections` as E4M3 codes with one scale a tensor (fp8.zig).
+    pub fn linQ(l: Loader, bytes: []const u8, n: usize, k: usize) !Lin {
+        if (!fp8_projections) return l.lin(bytes, n, k);
+        if (bytes.len != n * k * 2) return error.UnexpectedTensor;
+        const codes = try l.gpa.alloc(u8, n * k);
+        defer l.gpa.free(codes);
+        const scale = @import("fp8.zig").quantize(bytes, codes);
+        var src = try cuda.DeviceBuffer.fromHost(l.d, codes);
+        defer src.free();
+        var out = try cuda.DeviceBuffer.alloc(l.d, cuda.nvfp4.padded(n) * k);
+        errdefer out.free();
+        try l.packer.fp8Lane(l.s, src.ptr, out.ptr, n, k);
+        try l.s.synchronize();
+        try l.bufs.append(l.gpa, out);
+        return cuda.modelopt.fp8Weight(out.ptr, scale, n, k);
+    }
+
+    pub fn linQOf(l: Loader, comptime fmt: []const u8, args: anytype) !Lin {
+        const t = try l.tensor(fmt, args);
+        return l.linQ(t.bytes, t.dim(0), t.dim(1));
     }
 
     pub fn linOf(l: Loader, comptime fmt: []const u8, args: anytype) !Lin {
@@ -181,7 +206,7 @@ pub fn loadAttn(l: Loader, comptime a: []const u8, args: anytype, H_all: usize, 
     const st = try l.tensor(a ++ "learnable_sink_param", args); // fp32 in the target, bf16 in DFly
     var sink: [128]f32 = undefined;
     for (0..H) |h| sink[h] = if (st.dtype == .f32) std.mem.bytesAsValue(f32, st.bytes[(h0 + h) * 4 ..][0..4]).* else @bitCast(@as(u32, std.mem.readInt(u16, st.bytes[(h0 + h) * 2 ..][0..2], .little)) << 16);
-    return .{ .q_a = try l.linOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.lin((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .lins = lins, .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.lin((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.lin(o, hd, H * 256), .post_norm = try l.w(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
+    return .{ .q_a = try l.linQOf(a ++ "q_a_proj.weight", args), .q_a_norm = try l.w(a ++ "q_a_layernorm.weight", args), .q_b = try l.linQ((try l.tensor(a ++ "q_b_proj.weight", args)).bytes[h0 * 256 * q_rank * 2 ..][0 .. H * 256 * q_rank * 2], H * 256, q_rank), .kv_a = try l.linQOf(a ++ "kv_a_proj_with_mqa.weight", args), .kv_a_norm = try l.w(a ++ "kv_a_layernorm.weight", args), .wk = try l.up(wk), .wv = try l.up(wv), .lins = lins, .sink = try l.up(std.mem.sliceAsBytes(sink[0..H])), .gate = try l.linQ((try l.tensor(a ++ "linear_gate.weight", args)).bytes[h0 * 256 * hd * 2 ..][0 .. H * 256 * hd * 2], H * 256, hd), .o = try l.linQ(o, hd, H * 256), .post_norm = try l.w(a ++ "post_proj_norm.weight", args), .inv_freq = try l.up(std.mem.sliceAsBytes(&freqs)), .heads = H, .sliding = sliding };
 }
 
 pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, engram_here: bool) !Layer {
@@ -198,8 +223,8 @@ pub fn loadLayer(l: Loader, c: config.Text, i: usize, heads: [engram.heads]u32, 
     const mlp_: Mlp = if (!c.moe[i]) .{ .dense = .{ .t = try l.experts(mp, .{i}, true, 0, 1, c.dense_inter, l.rank * di, di, hd, 0), .norm = try l.w(mp ++ "post_fc2_norm.weight", .{i}) } } else .{ .moe = .{
         .router = try l.linOf(mp ++ "gate.weight", .{i}),
         .bias = try l.w(mp ++ "gate.e_score_correction_bias", .{i}),
-        .down = try l.linOf(mp ++ "routed_expert_down_proj.weight", .{i}),
-        .up = try l.linOf(mp ++ "routed_expert_up_proj.weight", .{i}),
+        .down = try l.linQOf(mp ++ "routed_expert_down_proj.weight", .{i}),
+        .up = try l.linQOf(mp ++ "routed_expert_up_proj.weight", .{i}),
         .routed = try l.experts(mp ++ "experts.", .{i}, false, l.rank * eo, eo, c.expert_inter, 0, c.expert_inter, c.latent, c.swiglu_limit),
         .shared = try l.experts(mp ++ "shared_experts.", .{i}, true, 0, 1, c.expert_inter * c.shared, l.rank * si, si, hd, 0),
         .norm = try l.w(mp ++ "combine_output_norm.weight", .{i}),
