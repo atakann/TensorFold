@@ -13,6 +13,16 @@ const ref = core.tree_round;
 
 pub const Which = enum { argmax, match, keep, gather, head };
 
+/// A planted control: the served body with one rule dropped (round_tree.cuh's flags), and the gate that must go red.
+pub const Control = struct { which: Which, name: []const u8, symbol: [:0]const u8, keep: i32, gate: g.Gate };
+
+/// argmax treats an infinity as a value, match reads past the budget, keep_rows fills the slots past the kept rows.
+pub const controls = [_]Control{
+    .{ .which = .argmax, .name = "control: tree_round picks without the infinity flags", .symbol = "tf_ctl_round_argmax", .keep = 6, .gate = .nonfinite },
+    .{ .which = .match, .name = "control: tree_round match without the budget stop", .symbol = "tf_ctl_tree_round_match", .keep = 5, .gate = .shapes },
+    .{ .which = .keep, .name = "control: tree_round kept rows without the -1 past them", .symbol = "tf_ctl_round_keep_rows", .keep = 3, .gate = .shapes },
+};
+
 fn noSums(_: c.Shape) usize {
     return 0;
 }
@@ -43,6 +53,8 @@ pub const Round = struct {
     rig: rig_.Rig,
     which: Which,
     k: *const tr.Kernels,
+    /// A planted control's kernel and entry; null runs the served kernel.
+    ctl: ?struct { f: cuda.Function, c: Control } = null,
     shape: c.Shape = .{ .rows = 0, .n = 0, .k = 0 },
     round: ?rt.Round = null,
     results: []tr.Result = &.{},
@@ -67,7 +79,9 @@ pub const Round = struct {
     }
 
     pub fn kernel(self: *Round) g.Kernel {
-        return .{ .spec = spec(self.which), .ctx = self, .vt = &vt };
+        var sp = spec(self.which);
+        if (self.ctl) |x| sp.name = x.c.name;
+        return .{ .spec = sp, .ctx = self, .vt = &vt, .control = if (self.ctl) |x| x.c.gate else null };
     }
 
     const vt = g.hooks(Round);
@@ -136,6 +150,32 @@ pub const Round = struct {
     pub fn run(self: *Round) !void {
         const s = self.rig.s;
         const n = self.shape.rows;
+        if (self.ctl) |x| {
+            var a: cuda.Args = .{};
+            const grid: [2]u32 = switch (self.which) {
+                .argmax => blk: {
+                    for ([_]u64{ self.in[0], self.out[0] }) |v| a.add(v);
+                    a.add(@as(u32, @intCast(self.shape.k)));
+                    a.add(@as(u32, @intCast(self.stride())));
+                    break :blk .{ @intCast(n), 256 };
+                },
+                .match => blk: {
+                    for ([_]u64{ self.in[0], self.in[1], self.in[2], self.in[3], self.in[4], self.out[0] }) |v| a.add(v);
+                    a.add(@as(u32, rt.vocab_small));
+                    a.add(@as(u32, @intCast(n)));
+                    break :blk .{ @intCast((n + 63) / 64), 64 };
+                },
+                .keep => blk: {
+                    for ([_]u64{ self.in[0], self.in[1], self.out[0], self.out[1] }) |v| a.add(v);
+                    a.add(@as(u32, @intCast(n)));
+                    break :blk .{ @intCast(n), tr.max_rows };
+                },
+                .gather, .head => return error.NoControl,
+            };
+            a.add(@as(c_int, x.c.keep));
+            try cuda.launch.launch(x.f, .{ .grid = .{ .x = grid[0], .y = 1, .z = 1 }, .block = .{ .x = grid[1] } }, s, &a);
+            return s.synchronize();
+        }
         switch (self.which) {
             .argmax => try self.k.argmax(s, self.in[0], self.out[0], n, self.shape.k, self.stride()),
             .match => try self.k.match(s, self.in[0], self.in[1], self.in[2], self.in[3], self.in[4], self.out[0], rt.vocab_small, n),

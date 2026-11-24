@@ -367,6 +367,10 @@ fn registered(gpu: check.Gpu, only: []const []const u8, t0: *i96) !g.Tally {
     for (std.enums.values(round_k.Which), &rounds) |w, *r| r.* = .{ .rig = .{ .gpu = gpu, .s = s }, .which = w, .k = &round_fns };
     defer for (&rounds) |*r| r.deinit();
     for (&rounds) |*r| try kernels.append(a, r.kernel());
+    var ctl_rounds: [round_k.controls.len]round_k.Round = undefined;
+    for (round_k.controls, &ctl_rounds) |x, *r| r.* = .{ .rig = .{ .gpu = gpu, .s = s }, .which = x.which, .k = &round_fns, .ctl = .{ .f = try mods[5].function(x.symbol), .c = x } };
+    defer for (&ctl_rounds) |*r| r.deinit();
+    for (&ctl_rounds) |*r| try kernels.append(a, r.kernel());
     var act_rows = try cuda.act_rows.ActRows.load(gpu.d);
     defer act_rows.unload();
     var acts: [std.enums.values(act_k.Which).len]act_k.Act = undefined;

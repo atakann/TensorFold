@@ -492,3 +492,23 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_ctl_pattn_64(const __nv_
 }
 }  // namespace tf_prefill_attention
 #include "contract_ctl_router.cuh"
+
+// tree_round.cu's picks, verified trees and kept rows with one rule dropped (`keep` lacks a tf_tree_round flag).
+#include "round_tree.cuh"
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_round_argmax(const uint16_t* logits, tf_tree_round::Pick* picks,
+                                                                      uint32_t vocab, uint32_t stride, int keep) {
+    tf_tree_round::argmax(logits, picks, vocab, stride, keep);
+}
+
+extern "C" __global__ void tf_ctl_tree_round_match(const uint32_t* tokens, const int32_t* parents,
+                                                   const tf_tree_round::Pick* picks, const uint32_t* eos,
+                                                   const tf_tree_round::Tree* trees, tf_tree_round::Result* results,
+                                                   uint32_t vocab, uint32_t count, int keep) {
+    tf_tree_round::match(tokens, parents, picks, eos, trees, results, vocab, count, keep);
+}
+
+extern "C" __global__ void tf_ctl_round_keep_rows(const tf_tree_round::Result* results, const tf_tree_round::Tree* trees,
+                                                  int32_t* kept, uint32_t* counts, uint32_t count, int keep) {
+    tf_tree_round::keep_rows(results, trees, kept, counts, count, keep);
+}
