@@ -47,7 +47,7 @@ __device__ __forceinline__ void argmax(const uint16_t* __restrict__ logits, Pick
     uint32_t id = INVALID, mask = 0;
     for (uint64_t token = lane; token < vocab; token += 256) {
         const float value = __uint_as_float(static_cast<uint32_t>(logits[static_cast<uint64_t>(row) * stride + token]) << 16);
-        if (isnan(value) || ((keep & FLAG_INF) && isinf(value))) mask |= isnan(value) ? 1u : value > 0 ? 2u : 4u;
+        if ((keep & FLAG_INF) ? !isfinite(value) : isnan(value)) mask |= isnan(value) ? 1u : value > 0 ? 2u : 4u;
         else if (id == INVALID || value > best || (value == best && token < id)) {
             best = value;
             id = static_cast<uint32_t>(token);
