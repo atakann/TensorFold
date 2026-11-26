@@ -213,6 +213,7 @@ def main(argv=None):
             sid.NVCC,sid.CUOBJDUMP=args.nvcc,args.cuobjdump
             report['compiler']=subprocess.check_output([args.nvcc,'--version'],text=True)
             report['disassembler']=subprocess.check_output([args.cuobjdump,'--version'],text=True)
+            report['assembler']=subprocess.check_output([sid.PTXAS,'--version'],text=True)
         if not args.plan_only:
             report['generated']={tag:sources.generate(tree,args,output,tag) for tag,tree in trees.items()}
         report['compiled_sources']={tag:sources.manifest(tree) for tag,tree in trees.items()}

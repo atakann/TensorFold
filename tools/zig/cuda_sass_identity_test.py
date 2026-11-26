@@ -86,5 +86,24 @@ class RecheckTest(unittest.TestCase):
         self.assertEqual(self.run_recheck(base, base, other, base), ([], ["late"]))
 
 
+
+class TwoStepTest(unittest.TestCase):
+    def test_ptxas_options_from_dryrun(self):
+        """The ptxas line of nvcc -dryrun gives its options; the temporary PTX and the -o output are dropped."""
+        dry = (
+            '#$ cicc --c++20 -arch compute_120 "/tmp/tmpxft_0000006d_00000000-6_ops.cpp1.ii" -o "/tmp/x.ptx"\n'
+            '#$ ptxas -arch=sm_120 -m64  --fmad false "/tmp/tmpxft_0000006d_00000000-6_ops.ptx"  -o "/tmp/nd/g.cubin"\n'
+        )
+        self.assertEqual(sid.ptxas_options(dry), ["-arch=sm_120", "-m64", "--fmad", "false"])
+
+    def test_dumps_per_sm(self):
+        """One cubin dump per SM, each after its own arch line, keeps the same function apart by SM."""
+        one = dump("NOP", "0x000fc00000000000").split("code for sm_121", 1)[1]
+        both = "arch = sm_120\n" + one + "arch = sm_121\n" + one.replace("NOP", "EXIT")
+        fn = sid.functions(both)
+        self.assertEqual(sorted(fn), [("sm_120", "late"), ("sm_120", "same"), ("sm_121", "late"), ("sm_121", "same")])
+        self.assertNotEqual(fn[("sm_120", "late")], fn[("sm_121", "late")])
+
+
 if __name__ == "__main__":
     unittest.main()

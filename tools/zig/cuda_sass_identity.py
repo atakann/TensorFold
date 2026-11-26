@@ -1,13 +1,16 @@
 """cuda_sass_identity.py BASE HEAD: cuobjdump -sass per function, base against head, of every image a change reaches."""
 import hashlib
+import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
 SMS = (80, 86, 89, 120, 121)
 NVCC = os.environ.get("NVCC", "/usr/local/cuda/bin/nvcc")
 CUOBJDUMP = os.environ.get("CUOBJDUMP", str(Path(NVCC).with_name("cuobjdump")))
+PTXAS = os.environ.get("PTXAS", str(Path(NVCC).with_name("ptxas")))
 GENERATED = ("qwen4_gdn", "qwen4_ple")  # regenerated from the production family owners before comparison
 CONTROLS = (
     ("fp4pair constant", "common/fp_pairs.cuh", r'"r"\(0x7E807E80u\)', '"r"(0x7E817E80u)'),
@@ -68,21 +71,46 @@ def includes(tree, unit):
     return {p.relative_to(tree.resolve()).as_posix() for p in seen}
 
 
+def ptxas_options(dryrun):
+    """ptxas's options in nvcc's -dryrun output, without its input PTX and its -o output."""
+    line = next(x for x in dryrun.splitlines() if re.match(r"#\$ ptxas\s", x))
+    args, keep, skip = shlex.split(line[3:])[1:], [], False
+    for a in args:
+        if skip or a == "-o" or a.endswith(".ptx"):
+            skip = a == "-o"
+            continue
+        keep.append(a)
+    return keep
+
+
 def build(tree, torch, img, out):
-    """nvcc -fatbin as zig/build/cuda_fatbin.zig runs it, then cuobjdump -sass; returns the dump or an error line."""
+    """Per SM nvcc -ptx, then ptxas with the options nvcc -dryrun gives it, then cuobjdump -sass; the dump or an error line."""
     unit, flags, arch, min_sm = img
-    gens = [f"-gencode=arch=compute_{s}{'a' if arch and s >= 120 else ''},code=sm_{s}{'a' if arch and s >= 120 else ''}"
-            for s in SMS if s >= min_sm]
-    if not gens:
+    sms = [f"sm_{s}{'a' if arch and s >= 120 else ''}" for s in SMS if s >= min_sm]
+    if not sms:
         return ""
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = ["nice", "-n", "19", NVCC, "-fatbin", *torch, *flags, f"-I{tree}/zig/kernels/cuda", *gens, "-o", str(out), f"{tree}/zig/kernels/cuda/{unit}.cu"]
-    out.with_suffix(".command.json").write_text(__import__("json").dumps(cmd, indent=2) + "\n")
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    out.with_suffix(".nvcc.log").write_text(r.stdout + r.stderr)
-    if r.returncode:
-        return "BUILD FAIL " + r.stderr[-600:]
-    dump = subprocess.run([CUOBJDUMP, "-sass", str(out)], capture_output=True, text=True, check=True).stdout
+    src, common = f"{tree}/zig/kernels/cuda/{unit}.cu", [*torch, *flags, f"-I{tree}/zig/kernels/cuda"]
+    cmds, ptx_sha, log, dumps = [], {}, "", []
+    for sm in sms:
+        ptx, cubin = out.with_suffix(f".{sm}.ptx"), out.with_suffix(f".{sm}.cubin")
+        dry = subprocess.run([NVCC, "-dryrun", "-cubin", *common, f"-arch={sm}", "-o", str(cubin), src],
+                             capture_output=True, text=True, check=False)
+        steps = [["nice", "-n", "19", NVCC, "-ptx", *common, f"-arch={sm.replace('sm_', 'compute_')}", "-o", str(ptx), src],
+                 ["nice", "-n", "19", PTXAS, *ptxas_options(dry.stdout + dry.stderr), str(ptx), "-o", str(cubin)]]
+        for cmd in steps:
+            cmds.append(cmd)
+            r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            log += r.stdout + r.stderr
+            if r.returncode:
+                out.with_suffix(".nvcc.log").write_text(log)
+                return "BUILD FAIL " + r.stderr[-600:]
+        ptx_sha[sm] = hashlib.sha256(ptx.read_bytes()).hexdigest()
+        dumps.append(f"arch = {sm}\n" + subprocess.run([CUOBJDUMP, "-sass", str(cubin)], capture_output=True, text=True, check=True).stdout)
+    out.with_suffix(".command.json").write_text(json.dumps(cmds, indent=2) + "\n")
+    out.with_suffix(".ptx.json").write_text(json.dumps(ptx_sha, indent=2) + "\n")
+    out.with_suffix(".nvcc.log").write_text(log)
+    dump = "".join(dumps)
     out.with_suffix(".sass").write_text(dump)
     return dump
 
