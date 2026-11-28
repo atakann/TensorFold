@@ -71,11 +71,20 @@ pub fn Cache(comptime K: type, comptime max_graphs: usize) type {
                 return pass.run();
             }
             var exec = capture(stream, pass) catch |err| return c.fail(err, pass);
-            errdefer exec.deinit();
-            try c.map.put(gpa, slot, .{ .key = key, .exec = exec });
+            {
+                errdefer exec.deinit();
+                try c.map.put(gpa, slot, .{ .key = key, .exec = exec });
+            }
+            // The map owns exec from here: a failed first launch takes the entry out, so no destroyed handle stays held.
             c.captures += 1;
             if (c.captures % 64 == 1) std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} held", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
-            try exec.launchOn(stream);
+            exec.launchOn(stream) catch |err| {
+                if (c.map.fetchRemove(slot)) |kv| {
+                    var gone = kv.value.exec;
+                    gone.deinit();
+                }
+                return err;
+            };
         }
 
         /// The stream is out of capture again: this pass eagerly, and the ones after it.

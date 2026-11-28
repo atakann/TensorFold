@@ -16,6 +16,9 @@ const Fake = struct {
     var eager: usize = 0;
     var destroyed: usize = 0;
     var verdict: abi.ExecUpdateResult = .success;
+    /// cuGraphLaunch fails while set, with 600 (not ready): Driver.check returns that one without the error log
+    /// a test runner counts as a failure, and the cache's cleanup does not depend on which error it was.
+    var launch_fails = false;
     fn begin(_: abi.Stream, _: abi.CaptureMode) callconv(.c) abi.Result {
         capturing = true;
         return 0;
@@ -47,6 +50,7 @@ const Fake = struct {
         return 0;
     }
     fn launch(_: abi.GraphExec, _: abi.Stream) callconv(.c) abi.Result {
+        if (launch_fails) return 600;
         launches += 1;
         return 0;
     }
@@ -77,7 +81,14 @@ fn expectAfter(c: *Cache, stream: Stream, k: Key, counts: [5]usize) !void {
     try t.expectEqual(counts, [5]usize{ Fake.records, Fake.instantiates, Fake.updates, Fake.eager, Fake.launches });
 }
 
-test "keyed graphs: a held graph takes new values in place; new launches get a new executable" {
+/// A driver of fake graph calls; the counts start from zero.
+fn fakeDriver() Driver {
+    Fake.records = 0;
+    Fake.instantiates = 0;
+    Fake.updates = 0;
+    Fake.launches = 0;
+    Fake.eager = 0;
+    Fake.destroyed = 0;
     var d: Driver = undefined;
     d.api.cuStreamBeginCapture_v2 = Fake.begin;
     d.api.cuStreamEndCapture = Fake.end;
@@ -88,6 +99,11 @@ test "keyed graphs: a held graph takes new values in place; new launches get a n
     d.api.cuGraphUpload = Fake.upload;
     d.api.cuGraphLaunch = Fake.launch;
     d.api.cuGraphExecDestroy = Fake.execDestroy;
+    return d;
+}
+
+test "keyed graphs: a held graph takes new values in place; new launches get a new executable" {
+    var d = fakeDriver();
     const previous = copy_source.current();
     copy_source.setCurrent(@ptrFromInt(0x3254));
     defer copy_source.setCurrent(previous);
@@ -110,4 +126,25 @@ test "keyed graphs: a held graph takes new values in place; new launches get a n
     try t.expectEqual([3]u64{ 1, 3, 3 }, [3]u64{ c.captures, c.updates, c.replays });
     c.clear(t.allocator);
     try t.expectEqual(@as(usize, 2), Fake.destroyed);
+}
+
+test "keyed graphs: a failed first launch leaves no destroyed executable in the cache" {
+    var d = fakeDriver();
+    const previous = copy_source.current();
+    copy_source.setCurrent(@ptrFromInt(0x3254));
+    defer copy_source.setCurrent(previous);
+    const stream: Stream = .{ .d = &d, .handle = @ptrFromInt(1) };
+    var c: Cache = .{};
+    defer c.clear(t.allocator);
+
+    try expectAfter(&c, stream, key(1, 3, 7), .{ 0, 0, 0, 1, 0 }); // eager once
+    Fake.launch_fails = true;
+    try t.expectError(error.NotReady, c.run(t.allocator, stream, key(1, 3, 7), Pass{}));
+    Fake.launch_fails = false;
+    try t.expectEqual(@as(usize, 1), Fake.destroyed); // the captured executable, freed once
+    try t.expectEqual(@as(u32, 0), c.map.count()); // and no longer held
+    try expectAfter(&c, stream, key(1, 3, 7), .{ 2, 2, 0, 1, 1 }); // captured again, launched
+    try expectAfter(&c, stream, key(1, 3, 7), .{ 2, 2, 0, 1, 2 }); // replayed
+    c.clear(t.allocator);
+    try t.expectEqual(@as(usize, 2), Fake.destroyed); // the first handle is not destroyed twice
 }
